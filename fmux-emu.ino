@@ -28,7 +28,7 @@ static constexpr int CAN_STANDBY_PIN = -1;
 #define TFT_CS    14
 #define TFT_DC    15
 #define TFT_RST   21
-#define TFT_BL    22
+#define TFT_BL    10
 static constexpr int TFT_BL_CHANNEL = 0;
 
 // --------- Wi-Fi AP ----------
@@ -69,6 +69,11 @@ static uint16_t lastCanColor = 0;
 static uint8_t brightness = 153; // 0-255 (≈60%)
 
 static void invalidateDisplayCache();
+
+static void applyBrightness(uint8_t value) {
+  brightness = value;
+  ledcWrite(TFT_BL_CHANNEL, brightness);
+}
 
 // --------- CAN Init ----------
 static const char* bitrateName(CanBitrate b) {
@@ -296,17 +301,25 @@ static String page() {
          "button{padding:12px 16px;border:1px solid #555;border-radius:10px;background:#2a2a2a;color:#fff;cursor:pointer}"
          "button:active{background:#3a3a3a} .info{background:#2a2a2a;padding:15px;border-radius:8px;margin-bottom:15px}"
          ".muted{color:#888;font-size:12px;margin-top:8px} .tag{display:inline-block;padding:4px 8px;border-radius:6px;background:#2a2a2a;margin-top:8px;font-size:12px;color:#0af}"
-         ".tag span{color:#fff}</style>"
-         "<script>setInterval(async()=>{let r=await fetch('/data');let d=await r.json();"
+         ".tag span{color:#fff} input[type=range]{width:100%;margin-top:12px}</style>"
+         "<script>let blSlider=null,blLock=false;function updateBrightnessLabel(v){document.getElementById('brightnessPct').innerText=Math.round(v/255*100)+'%';}"
+         "async function refresh(){let r=await fetch('/data');let d=await r.json();"
          "document.getElementById('temp').innerText=d.temp+'°C';"
          "document.getElementById('volt').innerText=d.volt+'V';"
          "document.getElementById('speed').innerText=d.speed;"
-         "},1000)</script>"
-         "<script>async function setSpeed(v){let r=await fetch('/cfg?speed='+v);if(!r.ok)alert('CAN reconfigure failed')}</script></head><body>");
+         "if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}else{updateBrightnessLabel(d.brightness);}}"
+         "window.addEventListener('DOMContentLoaded',()=>{blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});"
+         "blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}"
+         "refresh();setInterval(refresh,1000);});"
+         "async function setSpeed(v){let r=await fetch('/cfg?speed='+v);if(!r.ok)alert('CAN reconfigure failed');}"
+         "async function setBrightness(v){let r=await fetch('/brightness?value='+v);if(!r.ok)alert('Brightness update failed');}"
+         "async function btn(n){await fetch('/btn?n='+n);}</script></head><body>");
 
   s += F("<h2>🚗 PSA CAN Remote</h2>"
          "<div class='info'><b>Температура:</b> <span id='temp'>---</span> &nbsp;|&nbsp; "
          "<b>Напряжение:</b> <span id='volt'>---</span><br/><span class='tag'>CAN <span id='speed'>---</span></span></div>"
+         "<h3>Подсветка</h3>"
+         "<div class='info'><label for='bl'>Яркость подсветки: <span id='brightnessPct'>--%</span></label><input type='range' id='bl' min='0' max='255' value='153'/></div>"
          "<h3>Управление</h3>"
          "<div class='row'>"
          "<button onclick='btn(17)'>⚙️ Settings</button>"
@@ -323,7 +336,6 @@ static String page() {
          "<button onclick=\"setSpeed('500')\">500 кбит/с (Smeg+)</button>"
          "</div>"
          "<div class='muted'>Peugeot 307 (2006) full CAN • SMEG+ 2009</div>"
-         "<script>async function btn(n){await fetch('/btn?n='+n)}</script>"
          "</body></html>");
   return s;
 }
@@ -340,7 +352,9 @@ static void handleData() {
   json += (batteryVolt > 5.0f) ? String(batteryVolt, 1) : "\"---\"";
   json += ",\"speed\":\"";
   json += bitrateName(currentBitrate);
-  json += "\"}";
+  json += "\",\"brightness\":";
+  json += String((int)brightness);
+  json += "}";
   server.send(200, "application/json", json);
 }
 
@@ -356,6 +370,20 @@ static void handleBtn() {
     return;
   }
   pressIndex((uint8_t)n, 75);
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleBrightness() {
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "Missing value");
+    return;
+  }
+
+  int v = server.arg("value").toInt();
+  if (v < 0) v = 0;
+  if (v > 255) v = 255;
+
+  applyBrightness((uint8_t)v);
   server.send(200, "text/plain", "OK");
 }
 
@@ -395,7 +423,7 @@ void setup() {
   pinMode(TFT_BL, OUTPUT);
   ledcAttachPin(TFT_BL, TFT_BL_CHANNEL);
   ledcSetup(TFT_BL_CHANNEL, 5000, 8);
-  ledcWrite(TFT_BL_CHANNEL, brightness);
+  applyBrightness(brightness);
 
   if (CAN_STANDBY_PIN >= 0) {
     pinMode(CAN_STANDBY_PIN, OUTPUT);
@@ -421,6 +449,7 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/btn", HTTP_GET, handleBtn);
   server.on("/data", HTTP_GET, handleData);
+  server.on("/brightness", HTTP_GET, handleBrightness);
   server.on("/cfg", HTTP_GET, handleCfg);
   server.begin();
   Serial.println("[HTTP] Server started on :80");
