@@ -29,6 +29,7 @@ static constexpr int CAN_STANDBY_PIN = -1;
 #define TFT_DC    15
 #define TFT_RST   21
 #define TFT_BL    22
+static constexpr int TFT_BL_CHANNEL = 0;
 
 // --------- Wi-Fi AP ----------
 const char* AP_SSID = "ESP32-CAN-Remote";
@@ -65,7 +66,7 @@ static String lastCanText;
 static uint16_t lastTempColor = 0;
 static uint16_t lastVoltColor = 0;
 static uint16_t lastCanColor = 0;
-static uint8_t brightness = 255; // 0-255
+static uint8_t brightness = 153; // 0-255 (≈60%)
 
 static void invalidateDisplayCache();
 
@@ -392,7 +393,9 @@ void setup() {
   
   // Display
   pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
+  ledcAttachPin(TFT_BL, TFT_BL_CHANNEL);
+  ledcSetup(TFT_BL_CHANNEL, 5000, 8);
+  ledcWrite(TFT_BL_CHANNEL, brightness);
 
   if (CAN_STANDBY_PIN >= 0) {
     pinMode(CAN_STANDBY_PIN, OUTPUT);
