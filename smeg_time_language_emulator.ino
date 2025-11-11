@@ -10,8 +10,9 @@ static constexpr gpio_num_t CAN_RX = GPIO_NUM_23;
 static constexpr int CAN_STBY = -1; // set to pin number if transceiver standby must be toggled
 
 // ------------------------------ Frame parameters ------------------------------
-static constexpr uint32_t PERIOD_260_MS = 500;
-static constexpr uint32_t PERIOD_276_MS = 1000;
+// Keep the language/settings frame frequent to avoid the SMEG UI blinking
+static constexpr uint32_t PERIOD_260_MS = 100;
+static constexpr uint32_t PERIOD_276_MS = 500;
 
 static constexpr uint32_t ID_260 = 0x260; // BSI -> broadcast current settings
 static constexpr uint32_t ID_15B = 0x15B; // SMEG -> write settings
