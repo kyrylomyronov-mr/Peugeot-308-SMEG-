@@ -211,7 +211,8 @@ static inline void bsiSetBit(uint8_t &byte, uint8_t mask, bool value) {
 
 static void bsiApplyFeatureFlags() {
   // Byte 5 bit 0 announces the presence of a reversing camera to the SMEG head unit.
-  bsiSetBit(bsiState260[kBsiCamByte], kBsiCamMask, true);
+  // Force the bit to zero to disable camera announcements.
+  bsiSetBit(bsiState260[kBsiCamByte], kBsiCamMask, false);
 }
 
 static void bsiEnsureBaseline() {
