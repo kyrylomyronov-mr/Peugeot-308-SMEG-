@@ -420,6 +420,8 @@ void setup() {
   
   // Display
   pinMode(TFT_BL, OUTPUT);
+  analogWriteResolution(8);      // match the previous LEDC configuration
+  analogWriteFrequency(TFT_BL, 5000);
   applyBrightness(brightness);
 
   if (CAN_STANDBY_PIN >= 0) {
