@@ -75,8 +75,10 @@ static const char* bitrateName(CanBitrate b) {
 }
 
 static twai_timing_config_t timingFor(CanBitrate b) {
-  return (b == CanBitrate::k125k) ? TWAI_TIMING_CONFIG_125KBITS()
-                                  : TWAI_TIMING_CONFIG_500KBITS();
+  if (b == CanBitrate::k125k) {
+    return TWAI_TIMING_CONFIG_125KBITS();
+  }
+  return TWAI_TIMING_CONFIG_500KBITS();
 }
 
 static bool twaiStart() {
