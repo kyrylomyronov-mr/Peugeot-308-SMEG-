@@ -29,7 +29,6 @@ static constexpr int CAN_STANDBY_PIN = -1;
 #define TFT_DC    15
 #define TFT_RST   21
 #define TFT_BL    22
-static constexpr int TFT_BL_CHANNEL = 0;
 
 // --------- Wi-Fi AP ----------
 const char* AP_SSID = "ESP32-CAN-Remote";
@@ -72,7 +71,7 @@ static void invalidateDisplayCache();
 
 static void applyBrightness(uint8_t value) {
   brightness = value;
-  ledcWrite(TFT_BL_CHANNEL, brightness);
+  analogWrite(TFT_BL, brightness);
 }
 
 // --------- CAN Init ----------
@@ -421,12 +420,6 @@ void setup() {
   
   // Display
   pinMode(TFT_BL, OUTPUT);
-  // Configure PWM for the display backlight before attaching the GPIO pin.
-  // The Arduino ESP32 core (>= v3.0) expects ledcSetup to be called first,
-  // then ledcAttachPin. Doing it in this order also keeps compatibility with
-  // older cores that still expose ledcAttachPin.
-  ledcSetup(TFT_BL_CHANNEL, 5000, 8);
-  ledcAttachPin(TFT_BL, TFT_BL_CHANNEL);
   applyBrightness(brightness);
 
   if (CAN_STANDBY_PIN >= 0) {
