@@ -94,11 +94,14 @@ static bool bsiHave260 = false;
 static uint8_t bsiLang5 = 0b01110; // default Russian
 static bool bsiIs24h = true;
 static bool bsiIsCelsius = true;
+static constexpr uint8_t kBsiCamByte = 4;   // byte index for rear camera presence flag
+static constexpr uint8_t kBsiCamMask = 0x01; // bit mask for rear camera presence flag
 static time_t bsiPersistedEpoch = 0;
 static uint32_t bsiPersistedEpochMillis = 0;
 
 static void bsiEnsureBaseline();
 static void bsiApplyLangUnits();
+static void bsiApplyFeatureFlags();
 static void bsiSaveState();
 static void bsiLoadState();
 static void bsiPersistTime(time_t epoch);
@@ -206,11 +209,17 @@ static inline void bsiSetBit(uint8_t &byte, uint8_t mask, bool value) {
   if (value) byte |= mask; else byte &= static_cast<uint8_t>(~mask);
 }
 
+static void bsiApplyFeatureFlags() {
+  // Byte 5 bit 0 announces the presence of a reversing camera to the SMEG head unit.
+  bsiSetBit(bsiState260[kBsiCamByte], kBsiCamMask, true);
+}
+
 static void bsiEnsureBaseline() {
   if (bsiHave260) return;
   memset(bsiState260, 0, sizeof(bsiState260));
   bsiState260[0] |= 0x80; // menu active bit
   bsiHave260 = true;
+  bsiApplyFeatureFlags();
 }
 
 static void bsiApplyLangUnits() {
@@ -219,6 +228,7 @@ static void bsiApplyLangUnits() {
   bsiState260[0] = static_cast<uint8_t>(((bsiLang5 & 0x1Fu) << 2) | low2);
   bsiState260[0] |= 0x80;
   bsiSetBit(bsiState260[1], 0x40u, bsiIsCelsius);
+  bsiApplyFeatureFlags();
 }
 
 static void bsiSaveState() {
@@ -287,6 +297,7 @@ static void bsiHandle15B(const uint8_t *data, uint8_t len) {
   }
 
   bsiApplyLangUnits();
+  bsiApplyFeatureFlags();
   bsiSaveState();
   bsiSend260();
 }
