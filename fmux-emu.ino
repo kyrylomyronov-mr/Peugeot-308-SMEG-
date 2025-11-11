@@ -28,7 +28,7 @@ static constexpr int CAN_STANDBY_PIN = -1;
 #define TFT_CS    14
 #define TFT_DC    15
 #define TFT_RST   21
-#define TFT_BL    10
+#define TFT_BL    22
 static constexpr int TFT_BL_CHANNEL = 0;
 
 // --------- Wi-Fi AP ----------
