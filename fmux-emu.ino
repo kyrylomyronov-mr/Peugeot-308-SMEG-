@@ -12,6 +12,7 @@
 #include "driver/twai.h"
 #include <esp_err.h>
 #include <Arduino_GFX_Library.h>
+#include <Preferences.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -66,6 +67,9 @@ static uint16_t lastTempColor = 0;
 static uint16_t lastVoltColor = 0;
 static uint16_t lastCanColor = 0;
 static uint8_t brightness = 153; // 0-255 (≈60%)
+static Preferences prefs;
+static constexpr const char* kPrefsNamespace = "psacan";
+static constexpr const char* kPrefBrightness = "brightness";
 
 static void invalidateDisplayCache();
 
@@ -382,7 +386,12 @@ static void handleBrightness() {
   if (v < 0) v = 0;
   if (v > 255) v = 255;
 
-  applyBrightness((uint8_t)v);
+  uint8_t newBrightness = (uint8_t)v;
+  uint8_t previousBrightness = brightness;
+  applyBrightness(newBrightness);
+  if (newBrightness != previousBrightness) {
+    prefs.putUChar(kPrefBrightness, brightness);
+  }
   server.send(200, "text/plain", "OK");
 }
 
@@ -422,7 +431,10 @@ void setup() {
   pinMode(TFT_BL, OUTPUT);
   analogWriteResolution(TFT_BL, 8);      // match the previous LEDC configuration
   analogWriteFrequency(TFT_BL, 5000);
-  applyBrightness(brightness);
+
+  prefs.begin(kPrefsNamespace, false);
+  uint8_t savedBrightness = prefs.getUChar(kPrefBrightness, brightness);
+  applyBrightness(savedBrightness);
 
   if (CAN_STANDBY_PIN >= 0) {
     pinMode(CAN_STANDBY_PIN, OUTPUT);
