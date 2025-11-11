@@ -15,6 +15,8 @@
 #include <Preferences.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/time.h>
+#include <time.h>
 
 // --------- CAN pins (ESP32-C6) ----------
 static constexpr gpio_num_t CAN_TX = GPIO_NUM_20;
@@ -58,6 +60,8 @@ static float engineTemp = -99.0f;
 static float batteryVolt = 0.0f;
 static unsigned long lastCanRx = 0;
 static unsigned long lastDisplayUpdate = 0;
+static unsigned long lastBsi260 = 0;
+static unsigned long lastBsi276 = 0;
 // --------- Display cache / brightness ----------
 static bool uiInitialized = false;
 static String lastTempText;
@@ -70,6 +74,39 @@ static uint8_t brightness = 153; // 0-255 (≈60%)
 static Preferences prefs;
 static constexpr const char* kPrefsNamespace = "psacan";
 static constexpr const char* kPrefBrightness = "brightness";
+static constexpr const char* kPrefLang5 = "lang5";
+static constexpr const char* kPrefIs24 = "is24h";
+static constexpr const char* kPrefIsC = "isc";
+static constexpr const char* kPrefRaw260 = "raw260";
+static constexpr const char* kPrefEpoch = "epoch";
+static constexpr const char* kPrefEpochTs = "epoch_ts";
+
+// --------- BSI emulator state ----------
+static constexpr uint32_t CAN_ID_260 = 0x260; // BSI broadcast settings
+static constexpr uint32_t CAN_ID_15B = 0x15B; // SMEG -> write settings
+static constexpr uint32_t CAN_ID_39B = 0x39B; // SMEG -> write date/time
+static constexpr uint32_t CAN_ID_276 = 0x276; // BSI broadcast date/time
+static constexpr unsigned long BSI_PERIOD_260_MS = 500;
+static constexpr unsigned long BSI_PERIOD_276_MS = 1000;
+
+static uint8_t bsiState260[8] = {0};
+static bool bsiHave260 = false;
+static uint8_t bsiLang5 = 0b01110; // default Russian
+static bool bsiIs24h = true;
+static bool bsiIsCelsius = true;
+static time_t bsiPersistedEpoch = 0;
+static uint32_t bsiPersistedEpochMillis = 0;
+
+static void bsiEnsureBaseline();
+static void bsiApplyLangUnits();
+static void bsiSaveState();
+static void bsiLoadState();
+static void bsiPersistTime(time_t epoch);
+static void bsiHandle15B(const uint8_t *data, uint8_t len);
+static void bsiHandle39B(const uint8_t *data, uint8_t len);
+static void bsiSend260();
+static void bsiSend276();
+static void bsiTick();
 
 static void invalidateDisplayCache();
 
@@ -101,6 +138,9 @@ static bool twaiStart() {
   if (twai_start() != ESP_OK)                    { Serial.println("[CAN] start failed");          return false; }
   canStarted = true;
   Serial.printf("[CAN] started @%s (TX=%d RX=%d)\n", bitrateName(currentBitrate), (int)CAN_TX, (int)CAN_RX);
+  lastBsi260 = lastBsi276 = millis();
+  bsiSend260();
+  bsiSend276();
   return true;
 }
 
@@ -121,18 +161,25 @@ static bool twaiReconfigure(CanBitrate b) {
   engineTemp = -99.0f;
   batteryVolt = 0.0f;
   invalidateDisplayCache();
+  unsigned long now = millis();
+  lastBsi260 = now;
+  lastBsi276 = now;
   return twaiStart();
 }
 
 // --------- CAN TX ----------
-static bool canSend122(const uint8_t* d, uint8_t dlc) {
+static bool canSend(uint32_t id, const uint8_t* d, uint8_t dlc) {
   if (!canStarted || dlc > 8) return false;
   twai_message_t m = {};
-  m.identifier = 0x122;
+  m.identifier = id;
   m.flags = 0;
   m.data_length_code = dlc;
   if (dlc && d) memcpy(m.data, d, dlc);
   return (twai_transmit(&m, pdMS_TO_TICKS(20)) == ESP_OK);
+}
+
+static bool canSend122(const uint8_t* d, uint8_t dlc) {
+  return canSend(0x122, d, dlc);
 }
 
 static inline void sendIdle122() { uint8_t z[8] = {0}; canSend122(z, 8); }
@@ -151,6 +198,181 @@ static void pressIndex(uint8_t idx, uint16_t press_ms=75) {
   delay(120);
 }
 
+// --------- BSI Helpers ----------
+static inline void bsiSetBit(uint8_t &byte, uint8_t mask, bool value) {
+  if (value) byte |= mask; else byte &= static_cast<uint8_t>(~mask);
+}
+
+static void bsiEnsureBaseline() {
+  if (bsiHave260) return;
+  memset(bsiState260, 0, sizeof(bsiState260));
+  bsiState260[0] |= 0x80; // menu active bit
+  bsiHave260 = true;
+}
+
+static void bsiApplyLangUnits() {
+  bsiEnsureBaseline();
+  uint8_t low2 = bsiState260[0] & 0x03u;
+  bsiState260[0] = static_cast<uint8_t>(((bsiLang5 & 0x1Fu) << 2) | low2);
+  bsiState260[0] |= 0x80;
+  bsiSetBit(bsiState260[1], 0x40u, bsiIsCelsius);
+}
+
+static void bsiSaveState() {
+  bsiApplyLangUnits();
+  prefs.putUChar(kPrefLang5, bsiLang5);
+  prefs.putBool(kPrefIs24, bsiIs24h);
+  prefs.putBool(kPrefIsC, bsiIsCelsius);
+  prefs.putBytes(kPrefRaw260, bsiState260, sizeof(bsiState260));
+}
+
+static void bsiLoadState() {
+  size_t sz = prefs.getBytesLength(kPrefRaw260);
+  if (sz >= sizeof(bsiState260)) {
+    prefs.getBytes(kPrefRaw260, bsiState260, sizeof(bsiState260));
+    bsiHave260 = true;
+  } else {
+    bsiHave260 = false;
+  }
+
+  bsiLang5 = prefs.getUChar(kPrefLang5, bsiLang5);
+  bsiIs24h = prefs.getBool(kPrefIs24, bsiIs24h);
+  bsiIsCelsius = prefs.getBool(kPrefIsC, bsiIsCelsius);
+
+  bsiEnsureBaseline();
+  bsiApplyLangUnits();
+
+  bsiPersistedEpoch = static_cast<time_t>(prefs.getLong(kPrefEpoch, 0));
+  bsiPersistedEpochMillis = prefs.getUInt(kPrefEpochTs, 0);
+  if (bsiPersistedEpoch > 0) {
+    uint32_t nowMs = millis();
+    uint32_t baseMs = bsiPersistedEpochMillis;
+    uint32_t delta = (baseMs > 0 && nowMs >= baseMs) ? (nowMs - baseMs) : 0;
+    time_t epoch = bsiPersistedEpoch + static_cast<time_t>(delta / 1000u);
+    struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+    settimeofday(&tv, nullptr);
+  }
+}
+
+static void bsiPersistTime(time_t epoch) {
+  bsiPersistedEpoch = epoch;
+  bsiPersistedEpochMillis = millis();
+  prefs.putLong(kPrefEpoch, static_cast<long>(epoch));
+  prefs.putUInt(kPrefEpochTs, bsiPersistedEpochMillis);
+}
+
+static void bsiHandle15B(const uint8_t *data, uint8_t len) {
+  if (!data || len == 0) return;
+  if (len > 8) len = 8;
+  uint8_t buf[8] = {0};
+  memcpy(buf, data, len);
+
+  bsiEnsureBaseline();
+
+  bool useLangUnits = (buf[0] & 0x80u) != 0;
+  bool useTail = (len > 1) && ((buf[1] & 0x04u) != 0);
+
+  if (useTail) {
+    for (uint8_t i = 1; i < len && i < sizeof(bsiState260); ++i) {
+      bsiState260[i] = buf[i];
+    }
+  }
+
+  if (useLangUnits) {
+    bsiLang5 = static_cast<uint8_t>((buf[0] >> 2) & 0x1Fu);
+    bsiIsCelsius = (buf[1] & 0x40u) != 0;
+  }
+
+  bsiApplyLangUnits();
+  bsiSaveState();
+  bsiSend260();
+}
+
+static void bsiHandle39B(const uint8_t *data, uint8_t len) {
+  if (!data || len < 5) return;
+
+  struct {
+    bool is24;
+    uint16_t year;
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;
+    uint8_t minute;
+  } ct;
+
+  ct.is24 = (data[0] & 0x80u) != 0;
+  ct.year = 2000u + static_cast<uint16_t>(data[0] & 0x7Fu);
+  ct.month = data[1] & 0x0Fu;
+  ct.day = data[2] & 0x1Fu;
+  ct.hour = data[3] & 0x1Fu;
+  ct.minute = data[4] & 0x3Fu;
+
+  bsiIs24h = ct.is24;
+  bsiSaveState();
+
+  struct tm tmv = {};
+  tmv.tm_year = static_cast<int>(ct.year) - 1900;
+  tmv.tm_mon = (ct.month > 0) ? (ct.month - 1) : 0;
+  tmv.tm_mday = (ct.day > 0) ? ct.day : 1;
+  tmv.tm_hour = ct.hour;
+  tmv.tm_min = ct.minute;
+  tmv.tm_sec = 0;
+  time_t epoch = mktime(&tmv);
+  if (epoch != static_cast<time_t>(-1)) {
+    struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+    settimeofday(&tv, nullptr);
+    bsiPersistTime(epoch);
+  }
+
+  bsiSend276();
+}
+
+static void bsiBuild276(uint8_t out[7]) {
+  time_t nowEpoch = time(nullptr);
+  struct tm *t = localtime(&nowEpoch);
+  uint16_t year = t ? static_cast<uint16_t>(t->tm_year + 1900) : 2000u;
+  uint8_t mon = t ? static_cast<uint8_t>(t->tm_mon + 1) : 1u;
+  uint8_t day = t ? static_cast<uint8_t>(t->tm_mday) : 1u;
+  uint8_t hour = t ? static_cast<uint8_t>(t->tm_hour) : 0u;
+  uint8_t min = t ? static_cast<uint8_t>(t->tm_min) : 0u;
+
+  out[0] = (bsiIs24h ? 0x80u : 0x00u) | static_cast<uint8_t>((year >= 2000u) ? (year - 2000u) : 0u);
+  out[1] = mon & 0x0Fu;
+  out[2] = day & 0x1Fu;
+  out[3] = hour & 0x1Fu;
+  out[4] = min & 0x3Fu;
+  out[5] = 0x3Fu;
+  out[6] = 0xFEu;
+}
+
+static void bsiSend260() {
+  if (!canStarted) return;
+  bsiApplyLangUnits();
+  if (canSend(CAN_ID_260, bsiState260, sizeof(bsiState260))) {
+    lastBsi260 = millis();
+  }
+}
+
+static void bsiSend276() {
+  if (!canStarted) return;
+  uint8_t payload[7];
+  bsiBuild276(payload);
+  if (canSend(CAN_ID_276, payload, sizeof(payload))) {
+    lastBsi276 = millis();
+  }
+}
+
+static void bsiTick() {
+  if (!canStarted) return;
+  unsigned long now = millis();
+  if (now - lastBsi260 >= BSI_PERIOD_260_MS) {
+    bsiSend260();
+  }
+  if (now - lastBsi276 >= BSI_PERIOD_276_MS) {
+    bsiSend276();
+  }
+}
+
 // --------- CAN RX ----------
 static void readCanMessages() {
   twai_message_t msg;
@@ -162,10 +384,18 @@ static void readCanMessages() {
     if (msg.identifier == 0x0F6 && msg.data_length_code >= 1) {
       engineTemp = (float)msg.data[0] - 40.0f;
     }
-    
+
     // 0x128 - Напряжение (D5: * 10)
     if (msg.identifier == 0x128 && msg.data_length_code >= 6) {
       batteryVolt = (float)msg.data[5] / 10.0f;
+    }
+
+    if (msg.identifier == CAN_ID_15B && msg.data_length_code > 0) {
+      bsiHandle15B(msg.data, msg.data_length_code);
+    }
+
+    if (msg.identifier == CAN_ID_39B && msg.data_length_code >= 5) {
+      bsiHandle39B(msg.data, msg.data_length_code);
     }
   }
 }
@@ -423,6 +653,7 @@ void setup() {
   prefs.begin(kPrefsNamespace, false);
   uint8_t savedBrightness = prefs.getUChar(kPrefBrightness, brightness);
   applyBrightness(savedBrightness);
+  bsiLoadState();
 
   if (CAN_STANDBY_PIN >= 0) {
     pinMode(CAN_STANDBY_PIN, OUTPUT);
@@ -461,5 +692,6 @@ void setup() {
 void loop() {
   server.handleClient();
   readCanMessages();
+  bsiTick();
   updateDisplay();
 }
