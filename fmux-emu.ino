@@ -50,7 +50,7 @@ static constexpr uint8_t BTN_TRIP     = 30;
 static constexpr uint8_t BTN_AC       = 32;
 
 // --------- CAN data ----------
-enum class CanBitrate : uint8_t { k125k = 0, k500k };
+enum class CanBitrate : uint8_t { k125k = 0 };
 
 static bool canStarted = false;
 static CanBitrate currentBitrate = CanBitrate::k125k;
@@ -79,15 +79,10 @@ static void applyBrightness(uint8_t value) {
 }
 
 // --------- CAN Init ----------
-static const char* bitrateName(CanBitrate b) {
-  return (b == CanBitrate::k125k) ? "125k" : "500k";
-}
+static const char* bitrateName(CanBitrate /*b*/) { return "125k"; }
 
-static twai_timing_config_t timingFor(CanBitrate b) {
-  if (b == CanBitrate::k125k) {
-    return TWAI_TIMING_CONFIG_125KBITS();
-  }
-  return TWAI_TIMING_CONFIG_500KBITS();
+static twai_timing_config_t timingFor(CanBitrate /*b*/) {
+  return TWAI_TIMING_CONFIG_125KBITS();
 }
 
 static bool twaiStart() {
@@ -314,7 +309,6 @@ static String page() {
          "window.addEventListener('DOMContentLoaded',()=>{blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});"
          "blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}"
          "refresh();setInterval(refresh,1000);});"
-         "async function setSpeed(v){let r=await fetch('/cfg?speed='+v);if(!r.ok)alert('CAN reconfigure failed');}"
          "async function setBrightness(v){let r=await fetch('/brightness?value='+v);if(!r.ok)alert('Brightness update failed');}"
          "async function btn(n){await fetch('/btn?n='+n);}</script></head><body>");
 
@@ -334,10 +328,7 @@ static String page() {
          "<button onclick='btn(32)'>❄️ AC</button>"
          "</div>"
          "<h3>CAN скорость</h3>"
-         "<div class='row'>"
-         "<button onclick=\"setSpeed('125')\">125 кбит/с (Комфорт CAN)</button>"
-         "<button onclick=\"setSpeed('500')\">500 кбит/с (Smeg+)</button>"
-         "</div>"
+         "<div class='info'>125 кбит/с (Comfort CAN). SMEG поддерживает только эту скорость.</div>"
          "<div class='muted'>Peugeot 307 (2006) full CAN • SMEG+ 2009</div>"
          "</body></html>");
   return s;
@@ -402,15 +393,12 @@ static void handleCfg() {
   }
 
   String v = server.arg("speed");
-  CanBitrate target;
-  if (v == "125") target = CanBitrate::k125k;
-  else if (v == "500") target = CanBitrate::k500k;
-  else {
+  if (v != "125") {
     server.send(400, "text/plain", "Unknown speed");
     return;
   }
 
-  if (!twaiReconfigure(target)) {
+  if (!twaiReconfigure(CanBitrate::k125k)) {
     server.send(500, "text/plain", "CAN reconfigure failed");
     return;
   }
