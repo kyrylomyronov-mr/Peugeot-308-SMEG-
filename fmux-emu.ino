@@ -13,6 +13,7 @@
 #include <esp_err.h>
 #include <Arduino_GFX_Library.h>
 #include <string.h>
+#include <stdio.h>
 
 // --------- CAN pins (ESP32-C6) ----------
 static constexpr gpio_num_t CAN_TX = GPIO_NUM_20;
@@ -56,12 +57,17 @@ static float engineTemp = -99.0f;
 static float batteryVolt = 0.0f;
 static unsigned long lastCanRx = 0;
 static unsigned long lastDisplayUpdate = 0;
-static float prevEngineTemp = -999.0f;
-static float prevBatteryVolt = 0.0f;
-static bool prevCanStatus = false;
-
-// --------- Display brightness ----------
+// --------- Display cache / brightness ----------
+static bool uiInitialized = false;
+static String lastTempText;
+static String lastVoltText;
+static String lastCanText;
+static uint16_t lastTempColor = 0;
+static uint16_t lastVoltColor = 0;
+static uint16_t lastCanColor = 0;
 static uint8_t brightness = 255; // 0-255
+
+static void invalidateDisplayCache();
 
 // --------- CAN Init ----------
 static const char* bitrateName(CanBitrate b) {
@@ -106,11 +112,9 @@ static bool twaiReconfigure(CanBitrate b) {
 
   currentBitrate = b;
   lastCanRx = 0;
-  prevCanStatus = false;
-  prevEngineTemp = -999.0f;
-  prevBatteryVolt = 0.0f;
   engineTemp = -99.0f;
   batteryVolt = 0.0f;
+  invalidateDisplayCache();
   return twaiStart();
 }
 
@@ -161,85 +165,121 @@ static void readCanMessages() {
 }
 
 // --------- Display Update ----------
-static void updateDisplay() {
-  if (millis() - lastDisplayUpdate < 500) return;
-  lastDisplayUpdate = millis();
-  
-  bool canOk = (millis() - lastCanRx < 2000);
-  
-  // Обновляем только если значения изменились
-  bool needUpdate = false;
-  if (abs(engineTemp - prevEngineTemp) > 0.5f) needUpdate = true;
-  if (abs(batteryVolt - prevBatteryVolt) > 0.1f) needUpdate = true;
-  if (canOk != prevCanStatus) needUpdate = true;
-  
-  // Первый запуск - всегда рисуем
-  if (prevEngineTemp < -900.0f) needUpdate = true;
-  
-  if (!needUpdate) return;
-  
-  prevEngineTemp = engineTemp;
-  prevBatteryVolt = batteryVolt;
-  prevCanStatus = canOk;
-  
-  // Рисуем только изменившиеся области
-  
-  // Заголовок (один раз)
-  static bool headerDrawn = false;
-  if (!headerDrawn) {
-    gfx->fillRect(0, 0, 172, 40, BLACK);
-    gfx->setTextColor(WHITE);
-    gfx->setTextSize(2);
-    gfx->setCursor(10, 10);
-    gfx->println("PSA CAN");
-    headerDrawn = true;
-  }
-  
-  // Температура
-  gfx->fillRect(0, 40, 172, 40, BLACK);
+static constexpr int TEMP_X = 60;
+static constexpr int TEMP_Y = 50;
+static constexpr int TEMP_W = 112;
+static constexpr int TEMP_H = 24;
+static constexpr int VOLT_X = 60;
+static constexpr int VOLT_Y = 90;
+static constexpr int VOLT_W = 112;
+static constexpr int VOLT_H = 24;
+static constexpr int CAN_X  = 60;
+static constexpr int CAN_Y  = 130;
+static constexpr int CAN_W  = 112;
+static constexpr int CAN_H  = 10;
+
+static void invalidateDisplayCache() {
+  uiInitialized = false;
+  lastTempText = "";
+  lastVoltText = "";
+  lastCanText = "";
+  lastTempColor = 0;
+  lastVoltColor = 0;
+  lastCanColor = 0;
+}
+
+static void drawStaticUi() {
+  if (uiInitialized) return;
+
+  gfx->fillScreen(BLACK);
+
+  gfx->setTextColor(WHITE);
+  gfx->setTextSize(2);
+  gfx->setCursor(10, 10);
+  gfx->println("PSA CAN");
+
   gfx->setTextSize(3);
-  gfx->setCursor(10, 50);
   gfx->setTextColor(CYAN);
+  gfx->setCursor(10, 50);
   gfx->print("T:");
-  
-  if (engineTemp > -90.0f) {
-    if (engineTemp < 80) gfx->setTextColor(GREEN);
-    else if (engineTemp < 95) gfx->setTextColor(YELLOW);
-    else gfx->setTextColor(RED);
-    gfx->printf("%.0fC", engineTemp);
-  } else {
-    gfx->setTextColor(DARKGREY);
-    gfx->print("---");
-  }
-  
-  // Напряжение
-  gfx->fillRect(0, 80, 172, 40, BLACK);
-  gfx->setTextSize(3);
-  gfx->setCursor(10, 90);
+
   gfx->setTextColor(ORANGE);
+  gfx->setCursor(10, 90);
   gfx->print("V:");
-  
-  if (batteryVolt > 5.0f) {
-    if (batteryVolt >= 12.5f) gfx->setTextColor(GREEN);
-    else if (batteryVolt >= 12.0f) gfx->setTextColor(YELLOW);
-    else gfx->setTextColor(RED);
-    gfx->printf("%.1fV", batteryVolt);
-  } else {
-    gfx->setTextColor(DARKGREY);
-    gfx->print("---");
-  }
-  
-  // Статус CAN
-  gfx->fillRect(0, 120, 172, 20, BLACK);
+
   gfx->setTextSize(1);
+  gfx->setTextColor(WHITE);
   gfx->setCursor(10, 130);
-  if (canOk) {
-    gfx->setTextColor(GREEN);
-    gfx->printf("CAN: OK @%s", bitrateName(currentBitrate));
+  gfx->print("CAN:");
+
+  uiInitialized = true;
+}
+
+static void drawField(int x, int y, int w, int h, uint8_t textSize,
+                      const String &text, uint16_t color,
+                      String &lastText, uint16_t &lastColor) {
+  if (text == lastText && color == lastColor) return;
+
+  gfx->fillRect(x, y, w, h, BLACK);
+  gfx->setTextSize(textSize);
+  gfx->setCursor(x, y);
+  gfx->setTextColor(color);
+  gfx->print(text);
+
+  lastText = text;
+  lastColor = color;
+}
+
+static void updateDisplay() {
+  unsigned long now = millis();
+  if (now - lastDisplayUpdate < 150) return;
+  lastDisplayUpdate = now;
+
+  bool canOk = (now - lastCanRx < 2000);
+
+  drawStaticUi();
+
+  char buf[16];
+
+  String tempText;
+  uint16_t tempColor;
+  if (engineTemp > -90.0f) {
+    snprintf(buf, sizeof(buf), "%.0fC", engineTemp);
+    tempText = String(buf);
+    if (engineTemp < 80.0f) tempColor = GREEN;
+    else if (engineTemp < 95.0f) tempColor = YELLOW;
+    else tempColor = RED;
   } else {
-    gfx->setTextColor(RED);
-    gfx->printf("CAN: No data @%s", bitrateName(currentBitrate));
+    tempText = F("---");
+    tempColor = DARKGREY;
   }
+  drawField(TEMP_X, TEMP_Y, TEMP_W, TEMP_H, 3, tempText, tempColor,
+            lastTempText, lastTempColor);
+
+  String voltText;
+  uint16_t voltColor;
+  if (batteryVolt > 5.0f) {
+    snprintf(buf, sizeof(buf), "%.1fV", batteryVolt);
+    voltText = String(buf);
+    if (batteryVolt >= 12.5f) voltColor = GREEN;
+    else if (batteryVolt >= 12.0f) voltColor = YELLOW;
+    else voltColor = RED;
+  } else {
+    voltText = F("---");
+    voltColor = DARKGREY;
+  }
+  drawField(VOLT_X, VOLT_Y, VOLT_W, VOLT_H, 3, voltText, voltColor,
+            lastVoltText, lastVoltColor);
+
+  String canText;
+  uint16_t canColor = canOk ? GREEN : RED;
+  if (canOk) {
+    canText = String("OK @") + bitrateName(currentBitrate);
+  } else {
+    canText = String("No data @") + bitrateName(currentBitrate);
+  }
+  drawField(CAN_X, CAN_Y, CAN_W, CAN_H, 1, canText, canColor,
+            lastCanText, lastCanColor);
 }
 
 // --------- HTML ----------
@@ -382,6 +422,7 @@ void setup() {
 
   delay(1000);
   gfx->fillScreen(BLACK);
+  invalidateDisplayCache();
 }
 
 void loop() {
