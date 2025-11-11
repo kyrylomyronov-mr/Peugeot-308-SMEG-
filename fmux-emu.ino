@@ -108,6 +108,9 @@ static void bsiSend260();
 static void bsiSend276();
 static void bsiTick();
 
+static String iso8601Now();
+static bool parseIso8601(const String &iso, time_t &outEpoch);
+
 static void invalidateDisplayCache();
 
 static void applyBrightness(uint8_t value) {
@@ -373,6 +376,60 @@ static void bsiTick() {
   }
 }
 
+static String iso8601FromTm(const struct tm &tmv) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
+           tmv.tm_year + 1900,
+           tmv.tm_mon + 1,
+           tmv.tm_mday,
+           tmv.tm_hour,
+           tmv.tm_min,
+           tmv.tm_sec);
+  return String(buf);
+}
+
+static String iso8601Now() {
+  time_t nowEpoch = time(nullptr);
+  struct tm tmv;
+  if (!localtime_r(&nowEpoch, &tmv)) {
+    return String(F("1970-01-01T00:00:00"));
+  }
+  return iso8601FromTm(tmv);
+}
+
+static bool parseIso8601(const String &iso, time_t &outEpoch) {
+  int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+  int matched = sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d",
+                       &year, &month, &day, &hour, &minute, &second);
+  if (matched < 5) {
+    return false;
+  }
+  if (matched < 6) {
+    second = 0;
+  }
+  if (year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 ||
+      hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+    return false;
+  }
+
+  struct tm tmv = {};
+  tmv.tm_year = year - 1900;
+  tmv.tm_mon = month - 1;
+  tmv.tm_mday = day;
+  tmv.tm_hour = hour;
+  tmv.tm_min = minute;
+  tmv.tm_sec = second;
+  tmv.tm_isdst = -1;
+
+  time_t epoch = mktime(&tmv);
+  if (epoch == static_cast<time_t>(-1)) {
+    return false;
+  }
+
+  outEpoch = epoch;
+  return true;
+}
+
 // --------- CAN RX ----------
 static void readCanMessages() {
   twai_message_t msg;
@@ -520,34 +577,96 @@ static void updateDisplay() {
 
 // --------- HTML ----------
 static String page() {
-  String s; s.reserve(4500);
+  String s; s.reserve(6500);
   s += F("<!doctype html><html lang='ru'><head><meta charset='utf-8'/>"
          "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
          "<title>PSA CAN Remote</title>"
-         "<style>body{font-family:system-ui,Arial,sans-serif;margin:24px;background:#1a1a1a;color:#fff}"
-         "h2{margin:0 0 12px;color:#0af} .row{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:20px}"
-         "button{padding:12px 16px;border:1px solid #555;border-radius:10px;background:#2a2a2a;color:#fff;cursor:pointer}"
-         "button:active{background:#3a3a3a} .info{background:#2a2a2a;padding:15px;border-radius:8px;margin-bottom:15px}"
-         ".muted{color:#888;font-size:12px;margin-top:8px} .tag{display:inline-block;padding:4px 8px;border-radius:6px;background:#2a2a2a;margin-top:8px;font-size:12px;color:#0af}"
-         ".tag span{color:#fff} input[type=range]{width:100%;margin-top:12px}</style>"
-         "<script>let blSlider=null,blLock=false;function updateBrightnessLabel(v){document.getElementById('brightnessPct').innerText=Math.round(v/255*100)+'%';}"
-         "async function refresh(){let r=await fetch('/data');let d=await r.json();"
-         "document.getElementById('temp').innerText=d.temp+'°C';"
-         "document.getElementById('volt').innerText=d.volt+'V';"
-         "document.getElementById('speed').innerText=d.speed;"
-         "if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}else{updateBrightnessLabel(d.brightness);}}"
-         "window.addEventListener('DOMContentLoaded',()=>{blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});"
-         "blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}"
-         "refresh();setInterval(refresh,1000);});"
-         "async function setBrightness(v){let r=await fetch('/brightness?value='+v);if(!r.ok)alert('Brightness update failed');}"
-         "async function btn(n){await fetch('/btn?n='+n);}</script></head><body>");
+         "<style>body{font-family:'Inter',system-ui,Arial,sans-serif;margin:0;padding:24px;background:#0f172a;color:#f8fafc;}"
+         "main{max-width:960px;margin:0 auto;display:flex;flex-direction:column;gap:20px;}"
+         "h2{margin:0 0 8px;font-size:26px;}"
+         "h3{margin:0 0 12px;font-size:18px;color:#60a5fa;}"
+         ".card{background:#16213b;border-radius:16px;padding:22px;box-shadow:0 12px 40px rgba(8,15,35,0.45);}"
+         ".card p{margin:0 0 12px;}"
+         ".metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:18px;}"
+         ".metric .label{font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;}"
+         ".metric .value{font-size:26px;font-weight:600;color:#f1f5f9;}"
+         ".badge{display:inline-flex;align-items:center;padding:6px 14px;border-radius:999px;font-size:13px;font-weight:600;}"
+         ".badge.ok{background:rgba(34,197,94,0.18);color:#4ade80;}"
+         ".badge.err{background:rgba(248,113,113,0.18);color:#f87171;}"
+         ".range-row{display:flex;flex-direction:column;gap:12px;}"
+         ".toggle{display:flex;align-items:center;gap:10px;margin-top:10px;}"
+         ".toggle label{color:#cbd5f5;font-size:15px;}"
+         "input[type=range]{width:100%;accent-color:#2563eb;}"
+         "input[type=datetime-local]{padding:10px 14px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#e2e8f0;font-size:15px;}"
+         ".controls{display:flex;flex-wrap:wrap;gap:12px;}"
+         "button{padding:12px 18px;border:none;border-radius:10px;background:#1f2937;color:#f8fafc;font-size:15px;cursor:pointer;transition:background .2s,transform .2s;}"
+         "button:hover{background:#273548;transform:translateY(-1px);}"
+         "button:active{transform:scale(0.98);}"
+         "button.primary{background:#2563eb;}"
+         "button.primary:hover{background:#1d4ed8;}"
+         ".small{color:#94a3b8;font-size:13px;}"
+         ".row{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px;}"
+         ".row button{flex:1 1 140px;}"
+         "footer{color:#64748b;font-size:12px;text-align:center;padding:16px 0;}</style>"
+         "<script>let blSlider=null,blLock=false,prefLock=false,timeInput=null;"
+         "function updateBrightnessLabel(v){document.getElementById('brightnessPct').innerText=Math.round(v/255*100)+'%';}"
+         "function formatUptime(secs){secs=Number(secs||0);if(secs<0)secs=0;const h=Math.floor(secs/3600);const m=Math.floor((secs%3600)/60);const s=Math.floor(secs%60);let parts=[];if(h)parts.push(h+' ч');if(m||h)parts.push(m+' м');parts.push(s+' с');return parts.join(' ');}"
+         "async function refresh(){try{let r=await fetch('/data');if(!r.ok)return;let d=await r.json();const tempVal=(typeof d.temp==='number')?d.temp.toFixed(1):d.temp;document.getElementById('temp').innerText=tempVal+(d.isC?'°C':'°F');"
+         "const voltVal=(typeof d.volt==='number')?d.volt.toFixed(1):d.volt;document.getElementById('volt').innerText=voltVal+'V';document.getElementById('speed').innerText=d.speed||'---';document.getElementById('ip').innerText=d.ip||'—';document.getElementById('timeNow').innerText=(d.time||'--').replace('T',' ');document.getElementById('uptime').innerText=formatUptime(d.uptime);const badge=document.getElementById('canBadge');if(badge){badge.innerText=d.canOk?'CAN онлайн':'CAN нет данных';badge.className='badge '+(d.canOk?'ok':'err');}if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}if(!prefLock){const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24)is24.checked=!!d.is24;if(isc)isc.checked=!!d.isC;}if(timeInput&&document.activeElement!==timeInput&&d.time){let v=d.time.length>=16?d.time.substring(0,16):d.time;timeInput.value=v;}}catch(e){console.error(e);}}"
+         "function init(){blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}timeInput=document.getElementById('timeInput');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24){is24.addEventListener('change',()=>updatePref('is24',is24.checked));}if(isc){isc.addEventListener('change',()=>updatePref('isc',isc.checked));}refresh();setInterval(refresh,1500);}"
+         "async function setBrightness(v){try{let r=await fetch('/brightness?value='+v);if(!r.ok)throw new Error();}catch(e){alert('Не удалось обновить подсветку');}}"
+         "async function updatePref(name,val){prefLock=true;try{let r=await fetch('/prefs?'+name+'='+(val?'1':'0'));if(!r.ok)throw new Error();}catch(e){alert('Не удалось сохранить настройки');}finally{prefLock=false;}}"
+         "function pad2(n){return n.toString().padStart(2,'0');}"
+         "function isoLocalNow(){const d=new Date();return d.getFullYear()+'-'+pad2(d.getMonth()+1)+'-'+pad2(d.getDate())+'T'+pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds());}"
+         "async function syncTime(){const iso=isoLocalNow();try{let r=await fetch('/time?iso='+encodeURIComponent(iso));if(!r.ok)throw new Error();refresh();}catch(e){alert('Не удалось синхронизировать время');}}"
+         "async function setTimeFromInput(){if(!timeInput||!timeInput.value){alert('Введите дату и время');return;}let iso=timeInput.value;if(iso.length===16){iso+=':00';}try{let r=await fetch('/time?iso='+encodeURIComponent(iso));if(!r.ok)throw new Error();refresh();}catch(e){alert('Не удалось установить время');}}"
+         "async function btn(n){await fetch('/btn?n='+n);}"
+         "document.addEventListener('DOMContentLoaded',init);</script></head><body><main>");
 
-  s += F("<h2>🚗 PSA CAN Remote</h2>"
-         "<div class='info'><b>Температура:</b> <span id='temp'>---</span> &nbsp;|&nbsp; "
-         "<b>Напряжение:</b> <span id='volt'>---</span><br/><span class='tag'>CAN <span id='speed'>---</span></span></div>"
-         "<h3>Подсветка</h3>"
-         "<div class='info'><label for='bl'>Яркость подсветки: <span id='brightnessPct'>--%</span></label><input type='range' id='bl' min='0' max='255' value='153'/></div>"
-         "<h3>Управление</h3>"
+  s += F("<div class='card'>"
+         "<h2>🚗 PSA CAN Remote</h2>"
+         "<p class='small'>ESP32-C6 Comfort CAN контроллер. IP точки доступа: <strong id='ip'>--</strong></p>"
+         "<div class='metrics'>"
+         "<div class='metric'><div class='label'>Температура двигателя</div><div class='value' id='temp'>--°C</div></div>"
+         "<div class='metric'><div class='label'>Напряжение</div><div class='value' id='volt'>--V</div></div>"
+         "<div class='metric'><div class='label'>CAN скорость</div><div class='value' id='speed'>---</div></div>"
+         "<div class='metric'><div class='label'>Аптайм</div><div class='value' id='uptime'>--</div></div>"
+         "</div>"
+         "<span class='badge err' id='canBadge'>CAN нет данных</span>"
+         "</div>");
+
+  s += F("<div class='card'>"
+         "<h3>Подсветка дисплея</h3>"
+         "<div class='range-row'>"
+         "<label for='bl'>Яркость: <span id='brightnessPct'>--%</span></label>"
+         "<input type='range' id='bl' min='0' max='255' value='153'/>"
+         "</div>"
+         "<p class='small'>Настройка применяется сразу и сохраняется во встроенной памяти.</p>"
+         "</div>");
+
+  s += F("<div class='card'>"
+         "<h3>Настройки отображения</h3>"
+         "<div class='toggle'><input type='checkbox' id='is24'/><label for='is24'>24-часовой формат времени</label></div>"
+         "<div class='toggle'><input type='checkbox' id='isc'/><label for='isc'>Температура в градусах Цельсия</label></div>"
+         "<p class='small'>Параметры мгновенно применяются к эмуляции BSI и сохраняются в памяти.</p>"
+         "</div>");
+
+  s += F("<div class='card'>"
+         "<h3>Дата и время</h3>"
+         "<div class='metrics'>"
+         "<div class='metric'><div class='label'>Встроенные часы</div><div class='value' id='timeNow'>--</div></div>"
+         "</div>"
+         "<div class='controls'>"
+         "<input type='datetime-local' id='timeInput'/>"
+         "<button class='primary' onclick='setTimeFromInput()'>Установить вручную</button>"
+         "<button onclick='syncTime()'>Синхронизировать с браузером</button>"
+         "</div>"
+         "<p class='small'>Используйте для быстрой синхронизации часов SMEG без подключения к диагностике.</p>"
+         "</div>");
+
+  s += F("<div class='card'>"
+         "<h3>Быстрые команды</h3>"
+         "<p class='small'>Имитация нажатий физических кнопок на панели SMEG.</p>"
          "<div class='row'>"
          "<button onclick='btn(17)'>⚙️ Settings</button>"
          "<button onclick='btn(18)'>🗺️ Maps</button>"
@@ -557,10 +676,9 @@ static String page() {
          "<button onclick='btn(30)'>🛣️ Trip</button>"
          "<button onclick='btn(32)'>❄️ AC</button>"
          "</div>"
-         "<h3>CAN скорость</h3>"
-         "<div class='info'>125 кбит/с (Comfort CAN). SMEG поддерживает только эту скорость.</div>"
-         "<div class='muted'>Peugeot 307 (2006) full CAN • SMEG+ 2009</div>"
-         "</body></html>");
+         "</div>");
+
+  s += F("</main><footer>Comfort CAN remote • ESP32-C6</footer></body></html>");
   return s;
 }
 
@@ -571,13 +689,37 @@ static void handleRoot() {
 
 static void handleData() {
   String json = "{\"temp\":";
-  json += (engineTemp > -90.0f) ? String(engineTemp, 1) : "\"---\"";
+  if (engineTemp > -90.0f) {
+    float value = engineTemp;
+    if (!bsiIsCelsius) {
+      value = value * 9.0f / 5.0f + 32.0f;
+    }
+    json += String(value, 1);
+  } else {
+    json += "\"---\"";
+  }
   json += ",\"volt\":";
   json += (batteryVolt > 5.0f) ? String(batteryVolt, 1) : "\"---\"";
   json += ",\"speed\":\"";
   json += bitrateName(currentBitrate);
-  json += "\",\"brightness\":";
+  json += "\"";
+  json += ",\"brightness\":";
   json += String((int)brightness);
+  json += ",\"is24\":";
+  json += bsiIs24h ? "true" : "false";
+  json += ",\"isC\":";
+  json += bsiIsCelsius ? "true" : "false";
+  json += ",\"time\":\"";
+  json += iso8601Now();
+  json += "\"";
+  json += ",\"ip\":\"";
+  json += WiFi.softAPIP().toString();
+  json += "\"";
+  json += ",\"canOk\":";
+  bool canOk = (millis() - lastCanRx) < 2000u;
+  json += canOk ? "true" : "false";
+  json += ",\"uptime\":";
+  json += String((uint32_t)(millis() / 1000u));
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -636,6 +778,69 @@ static void handleCfg() {
   server.send(200, "text/plain", "OK");
 }
 
+static void handlePrefs() {
+  bool changed = false;
+  bool need260 = false;
+  bool need276 = false;
+
+  if (server.hasArg("is24")) {
+    bool newVal = server.arg("is24") != "0";
+    if (newVal != bsiIs24h) {
+      bsiIs24h = newVal;
+      changed = true;
+      need276 = true;
+    }
+  }
+
+  if (server.hasArg("isc")) {
+    bool newVal = server.arg("isc") != "0";
+    if (newVal != bsiIsCelsius) {
+      bsiIsCelsius = newVal;
+      changed = true;
+      need260 = true;
+    }
+  }
+
+  if (changed) {
+    bsiSaveState();
+    if (need260) {
+      bsiSend260();
+    }
+    if (need276) {
+      bsiSend276();
+    }
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleTime() {
+  time_t epoch = 0;
+  bool ok = false;
+
+  if (server.hasArg("epoch")) {
+    long val = server.arg("epoch").toInt();
+    if (val > 0) {
+      epoch = static_cast<time_t>(val);
+      ok = true;
+    }
+  } else if (server.hasArg("iso")) {
+    ok = parseIso8601(server.arg("iso"), epoch);
+  }
+
+  if (!ok) {
+    server.send(400, "text/plain", "Invalid time");
+    return;
+  }
+
+  struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+  settimeofday(&tv, nullptr);
+  bsiPersistTime(epoch);
+  bsiSend276();
+
+  server.send(200, "text/plain", "OK");
+}
+
 // --------- Setup/Loop ----------
 void setup() {
   Serial.begin(115200);
@@ -681,6 +886,8 @@ void setup() {
   server.on("/data", HTTP_GET, handleData);
   server.on("/brightness", HTTP_GET, handleBrightness);
   server.on("/cfg", HTTP_GET, handleCfg);
+  server.on("/prefs", HTTP_GET, handlePrefs);
+  server.on("/time", HTTP_GET, handleTime);
   server.begin();
   Serial.println("[HTTP] Server started on :80");
 
