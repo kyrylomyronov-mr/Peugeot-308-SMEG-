@@ -1,7 +1,8 @@
 /*
  * PSA Comfort CAN Remote — с дисплеем (Arduino_GFX для ESP32-C6)
  * Waveshare ESP32-C6 1.47inch Display
- * CAN: 125 кбит/с, TX=GPIO20, RX=GPIO23
+ * CAN: 125/500 кбит/с, TX=GPIO20, RX=GPIO23
+ * SN65HVD230 RS (standby) pin: set CAN_STANDBY_PIN accordingly
  * 
  * Установите библиотеку: Arduino_GFX by moononournation
  */
@@ -9,12 +10,16 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include "driver/twai.h"
+#include <esp_err.h>
 #include <Arduino_GFX_Library.h>
 #include <string.h>
 
 // --------- CAN pins (ESP32-C6) ----------
 static constexpr gpio_num_t CAN_TX = GPIO_NUM_20;
 static constexpr gpio_num_t CAN_RX = GPIO_NUM_23;
+
+// SN65HVD230 transceiver standby (RS) pin. Set to -1 if RS is tied to GND.
+static constexpr int CAN_STANDBY_PIN = -1;
 
 // --------- Display pins (Waveshare ESP32-C6 1.47") ----------
 #define TFT_MOSI  6
@@ -43,31 +48,70 @@ static constexpr uint8_t BTN_TRIP     = 30;
 static constexpr uint8_t BTN_AC       = 32;
 
 // --------- CAN data ----------
+enum class CanBitrate : uint8_t { k125k = 0, k500k };
+
 static bool canStarted = false;
+static CanBitrate currentBitrate = CanBitrate::k125k;
 static float engineTemp = -99.0f;
 static float batteryVolt = 0.0f;
 static unsigned long lastCanRx = 0;
+static unsigned long lastDisplayUpdate = 0;
+static float prevEngineTemp = -999.0f;
+static float prevBatteryVolt = 0.0f;
+static bool prevCanStatus = false;
 
 // --------- Display brightness ----------
 static uint8_t brightness = 255; // 0-255
 
 // --------- CAN Init ----------
-static bool twaiStart125k() {
+static const char* bitrateName(CanBitrate b) {
+  return (b == CanBitrate::k125k) ? "125k" : "500k";
+}
+
+static twai_timing_config_t timingFor(CanBitrate b) {
+  return (b == CanBitrate::k125k) ? TWAI_TIMING_CONFIG_125KBITS()
+                                  : TWAI_TIMING_CONFIG_500KBITS();
+}
+
+static bool twaiStart() {
   if (canStarted) return true;
+
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX, CAN_RX, TWAI_MODE_NORMAL);
   g.tx_queue_len = 8;
   g.rx_queue_len = 16;
   g.clkout_divider = 0;
   g.alerts_enabled = 0;
 
-  twai_timing_config_t t = TWAI_TIMING_CONFIG_125KBITS();
+  twai_timing_config_t t = timingFor(currentBitrate);
   twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
   if (twai_driver_install(&g, &t, &f) != ESP_OK) { Serial.println("[CAN] driver install failed"); return false; }
   if (twai_start() != ESP_OK)                    { Serial.println("[CAN] start failed");          return false; }
   canStarted = true;
-  Serial.printf("[CAN] started @125k (TX=%d RX=%d)\n", (int)CAN_TX, (int)CAN_RX);
+  Serial.printf("[CAN] started @%s (TX=%d RX=%d)\n", bitrateName(currentBitrate), (int)CAN_TX, (int)CAN_RX);
   return true;
+}
+
+static bool twaiReconfigure(CanBitrate b) {
+  if (currentBitrate == b && canStarted) return true;
+
+  if (canStarted) {
+    esp_err_t err = twai_stop();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) Serial.printf("[CAN] stop error: %d\n", (int)err);
+    err = twai_driver_uninstall();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) Serial.printf("[CAN] uninstall error: %d\n", (int)err);
+    canStarted = false;
+    delay(50);
+  }
+
+  currentBitrate = b;
+  lastCanRx = 0;
+  prevCanStatus = false;
+  prevEngineTemp = -999.0f;
+  prevBatteryVolt = 0.0f;
+  engineTemp = -99.0f;
+  batteryVolt = 0.0f;
+  return twaiStart();
 }
 
 // --------- CAN TX ----------
@@ -117,11 +161,6 @@ static void readCanMessages() {
 }
 
 // --------- Display Update ----------
-static unsigned long lastDisplayUpdate = 0;
-static float prevEngineTemp = -999.0f;
-static float prevBatteryVolt = 0.0f;
-static bool prevCanStatus = false;
-
 static void updateDisplay() {
   if (millis() - lastDisplayUpdate < 500) return;
   lastDisplayUpdate = millis();
@@ -196,10 +235,10 @@ static void updateDisplay() {
   gfx->setCursor(10, 130);
   if (canOk) {
     gfx->setTextColor(GREEN);
-    gfx->print("CAN: OK");
+    gfx->printf("CAN: OK @%s", bitrateName(currentBitrate));
   } else {
     gfx->setTextColor(RED);
-    gfx->print("CAN: No data");
+    gfx->printf("CAN: No data @%s", bitrateName(currentBitrate));
   }
 }
 
@@ -213,14 +252,18 @@ static String page() {
          "h2{margin:0 0 12px;color:#0af} .row{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:20px}"
          "button{padding:12px 16px;border:1px solid #555;border-radius:10px;background:#2a2a2a;color:#fff;cursor:pointer}"
          "button:active{background:#3a3a3a} .info{background:#2a2a2a;padding:15px;border-radius:8px;margin-bottom:15px}"
-         ".muted{color:#888;font-size:12px;margin-top:8px}</style>"
+         ".muted{color:#888;font-size:12px;margin-top:8px} .tag{display:inline-block;padding:4px 8px;border-radius:6px;background:#2a2a2a;margin-top:8px;font-size:12px;color:#0af}"
+         ".tag span{color:#fff}</style>"
          "<script>setInterval(async()=>{let r=await fetch('/data');let d=await r.json();"
          "document.getElementById('temp').innerText=d.temp+'°C';"
-         "document.getElementById('volt').innerText=d.volt+'V'},1000)</script></head><body>");
+         "document.getElementById('volt').innerText=d.volt+'V';"
+         "document.getElementById('speed').innerText=d.speed;"
+         "},1000)</script>"
+         "<script>async function setSpeed(v){let r=await fetch('/cfg?speed='+v);if(!r.ok)alert('CAN reconfigure failed')}</script></head><body>");
 
   s += F("<h2>🚗 PSA CAN Remote</h2>"
          "<div class='info'><b>Температура:</b> <span id='temp'>---</span> &nbsp;|&nbsp; "
-         "<b>Напряжение:</b> <span id='volt'>---</span></div>"
+         "<b>Напряжение:</b> <span id='volt'>---</span><br/><span class='tag'>CAN <span id='speed'>---</span></span></div>"
          "<h3>Управление</h3>"
          "<div class='row'>"
          "<button onclick='btn(17)'>⚙️ Settings</button>"
@@ -231,7 +274,12 @@ static String page() {
          "<button onclick='btn(30)'>🛣️ Trip</button>"
          "<button onclick='btn(32)'>❄️ AC</button>"
          "</div>"
-         "<div class='muted'>Peugeot 307 2006</div>"
+         "<h3>CAN скорость</h3>"
+         "<div class='row'>"
+         "<button onclick=\"setSpeed('125')\">125 кбит/с (Комфорт CAN)</button>"
+         "<button onclick=\"setSpeed('500')\">500 кбит/с (Smeg+)</button>"
+         "</div>"
+         "<div class='muted'>Peugeot 307 (2006) full CAN • SMEG+ 2009</div>"
          "<script>async function btn(n){await fetch('/btn?n='+n)}</script>"
          "</body></html>");
   return s;
@@ -247,14 +295,16 @@ static void handleData() {
   json += (engineTemp > -90.0f) ? String(engineTemp, 1) : "\"---\"";
   json += ",\"volt\":";
   json += (batteryVolt > 5.0f) ? String(batteryVolt, 1) : "\"---\"";
-  json += "}";
+  json += ",\"speed\":\"";
+  json += bitrateName(currentBitrate);
+  json += "\"}";
   server.send(200, "application/json", json);
 }
 
 static void handleBtn() {
-  if (!server.hasArg("n")) { 
-    server.send(400, "text/plain", "Missing param"); 
-    return; 
+  if (!server.hasArg("n")) {
+    server.send(400, "text/plain", "Missing param");
+    return;
   }
   int n = server.arg("n").toInt();
   if (!(n==BTN_SETTINGS || n==BTN_MAPS || n==BTN_RADIO || n==BTN_PHONE ||
@@ -263,6 +313,29 @@ static void handleBtn() {
     return;
   }
   pressIndex((uint8_t)n, 75);
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleCfg() {
+  if (!server.hasArg("speed")) {
+    server.send(400, "text/plain", "Missing speed");
+    return;
+  }
+
+  String v = server.arg("speed");
+  CanBitrate target;
+  if (v == "125") target = CanBitrate::k125k;
+  else if (v == "500") target = CanBitrate::k500k;
+  else {
+    server.send(400, "text/plain", "Unknown speed");
+    return;
+  }
+
+  if (!twaiReconfigure(target)) {
+    server.send(500, "text/plain", "CAN reconfigure failed");
+    return;
+  }
+
   server.send(200, "text/plain", "OK");
 }
 
@@ -278,7 +351,12 @@ void setup() {
   // Display
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
-  
+
+  if (CAN_STANDBY_PIN >= 0) {
+    pinMode(CAN_STANDBY_PIN, OUTPUT);
+    digitalWrite(CAN_STANDBY_PIN, LOW);
+  }
+
   gfx->begin();
   gfx->fillScreen(BLACK);
   gfx->setTextColor(WHITE);
@@ -292,12 +370,13 @@ void setup() {
   Serial.printf("[WiFi] AP: %s, IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
   // CAN
-  if (!twaiStart125k()) Serial.println("[CAN] init failed");
+  if (!twaiStart()) Serial.println("[CAN] init failed");
 
   // HTTP
   server.on("/", HTTP_GET, handleRoot);
   server.on("/btn", HTTP_GET, handleBtn);
   server.on("/data", HTTP_GET, handleData);
+  server.on("/cfg", HTTP_GET, handleCfg);
   server.begin();
   Serial.println("[HTTP] Server started on :80");
 
