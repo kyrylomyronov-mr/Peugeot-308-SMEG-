@@ -15,6 +15,7 @@
 #include <Preferences.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -86,6 +87,14 @@ static constexpr uint32_t CAN_ID_260 = 0x260; // BSI broadcast settings
 static constexpr uint32_t CAN_ID_15B = 0x15B; // SMEG -> write settings
 static constexpr uint32_t CAN_ID_39B = 0x39B; // SMEG -> write date/time
 static constexpr uint32_t CAN_ID_276 = 0x276; // BSI broadcast date/time
+static constexpr uint32_t CAN_ID_01C = 0x01C; // SMEG -> preset speeds
+static constexpr uint32_t CAN_ID_361 = 0x361; // BSI options availability
+static constexpr uint32_t CAN_ID_228 = 0x228; // BSI cruise state
+static constexpr uint32_t CAN_ID_1E7 = 0x1E7; // BSI time gap indicator
+static constexpr uint32_t CAN_ID_1E8 = 0x1E8; // BSI preset speeds broadcast
+static constexpr uint32_t CAN_ID_2A8 = 0x2A8; // BSI intelligent speed limiter
+static constexpr uint32_t CAN_ID_227 = 0x227; // BSI button indicator states
+static constexpr uint32_t CAN_ID_2AD = 0x2AD; // BSI climate peripheral data
 static constexpr unsigned long BSI_PERIOD_260_MS = 500;
 static constexpr unsigned long BSI_PERIOD_276_MS = 1000;
 
@@ -99,12 +108,79 @@ static constexpr uint8_t kBsiCamMask = 0x01; // bit mask for rear camera presenc
 static time_t bsiPersistedEpoch = 0;
 static uint32_t bsiPersistedEpochMillis = 0;
 
+static constexpr const char* kPrefMod361 = "mod361";
+static constexpr const char* kPrefMod228 = "mod228";
+static constexpr const char* kPrefMod1E7 = "mod1e7";
+static constexpr const char* kPrefMod1E8 = "mod1e8";
+static constexpr const char* kPrefMod2A8 = "mod2a8";
+static constexpr const char* kPrefMod227 = "mod227";
+static constexpr const char* kPrefMod2AD = "mod2ad";
+static constexpr const char* kPrefMemSpeeds = "memspd";
+
+struct BsiModuleConfig {
+  uint32_t id;
+  const char* prefKey;
+  unsigned long periodMs;
+  uint8_t len;
+  uint8_t data[8];
+  unsigned long lastSent;
+  bool enabled;
+};
+
+static BsiModuleConfig bsiModules[] = {
+  {CAN_ID_361, kPrefMod361, 500, 6, {0xB5, 0x7E, 0x2C, 0x3B, 0x00, 0x00, 0, 0}, 0, true},
+  {CAN_ID_228, kPrefMod228, 1000, 8, {0xFF, 0xFF, 0x00, 0x80, 0x14, 0x7F, 0xFF, 0x00}, 0, true},
+  {CAN_ID_1E7, kPrefMod1E7, 200, 7, {0x40, 0x00, 0xFE, 0x65, 0xFF, 0x00, 0x00, 0}, 0, true},
+  {CAN_ID_1E8, kPrefMod1E8, 1000, 8, {0x45, 0xA0, 0x9F, 0x31, 0x46, 0x5A, 0x6E, 0x81}, 0, true},
+  {CAN_ID_2A8, kPrefMod2A8, 1000, 1, {0x80, 0, 0, 0, 0, 0, 0, 0}, 0, true},
+  {CAN_ID_227, kPrefMod227, 500, 5, {0x00, 0x50, 0x11, 0x30, 0x00, 0, 0, 0}, 0, true},
+  {CAN_ID_2AD, kPrefMod2AD, 500, 5, {0x0E, 0x00, 0x00, 0x53, 0x32, 0, 0, 0}, 0, true},
+};
+
+static constexpr size_t kBsiModuleCount = sizeof(bsiModules) / sizeof(bsiModules[0]);
+
+static BsiModuleConfig* bsiFindModule(uint32_t id) {
+  for (size_t i = 0; i < kBsiModuleCount; ++i) {
+    if (bsiModules[i].id == id) {
+      return &bsiModules[i];
+    }
+  }
+  return nullptr;
+}
+
+static void bsiLoadModulesFromPrefs() {
+  for (size_t i = 0; i < kBsiModuleCount; ++i) {
+    BsiModuleConfig &m = bsiModules[i];
+    if (m.prefKey) {
+      m.enabled = prefs.getBool(m.prefKey, m.enabled);
+    }
+    m.lastSent = 0;
+  }
+
+  BsiModuleConfig *memModule = bsiFindModule(CAN_ID_1E8);
+  if (memModule) {
+    size_t stored = prefs.getBytesLength(kPrefMemSpeeds);
+    if (stored >= memModule->len) {
+      prefs.getBytes(kPrefMemSpeeds, memModule->data, memModule->len);
+    }
+  }
+}
+
+static void bsiPersistMemModule(const BsiModuleConfig &module) {
+  if (module.id == CAN_ID_1E8) {
+    prefs.putBytes(kPrefMemSpeeds, module.data, module.len);
+  }
+}
+
+static void bsiSendModule(BsiModuleConfig &module);
+
 static void bsiEnsureBaseline();
 static void bsiApplyLangUnits();
 static void bsiApplyFeatureFlags();
 static void bsiSaveState();
 static void bsiLoadState();
 static void bsiPersistTime(time_t epoch);
+static void bsiHandle01C(const uint8_t *data, uint8_t len);
 static void bsiHandle15B(const uint8_t *data, uint8_t len);
 static void bsiHandle39B(const uint8_t *data, uint8_t len);
 static void bsiSend260();
@@ -147,6 +223,11 @@ static bool twaiStart() {
   lastBsi260 = lastBsi276 = millis();
   bsiSend260();
   bsiSend276();
+  for (size_t i = 0; i < kBsiModuleCount; ++i) {
+    if (bsiModules[i].enabled) {
+      bsiSendModule(bsiModules[i]);
+    }
+  }
   return true;
 }
 
@@ -189,6 +270,14 @@ static bool canSend122(const uint8_t* d, uint8_t dlc) {
 }
 
 static inline void sendIdle122() { uint8_t z[8] = {0}; canSend122(z, 8); }
+
+static void bsiSendModule(BsiModuleConfig &module) {
+  if (!module.enabled || !canStarted) return;
+  if (module.len == 0 || module.len > 8) return;
+  if (canSend(module.id, module.data, module.len)) {
+    module.lastSent = millis();
+  }
+}
 
 static void pressIndex(uint8_t idx, uint16_t press_ms=75) {
   if (idx < 1 || idx > 40) return;
@@ -266,6 +355,8 @@ static void bsiLoadState() {
     struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
     settimeofday(&tv, nullptr);
   }
+
+  bsiLoadModulesFromPrefs();
 }
 
 static void bsiPersistTime(time_t epoch) {
@@ -273,6 +364,31 @@ static void bsiPersistTime(time_t epoch) {
   bsiPersistedEpochMillis = millis();
   prefs.putLong(kPrefEpoch, static_cast<long>(epoch));
   prefs.putUInt(kPrefEpochTs, bsiPersistedEpochMillis);
+}
+
+static void bsiHandle01C(const uint8_t *data, uint8_t len) {
+  BsiModuleConfig *memModule = bsiFindModule(CAN_ID_1E8);
+  if (!memModule || !data || len < 3) {
+    return;
+  }
+
+  if (memModule->len < 3) {
+    return;
+  }
+
+  uint8_t limit = memModule->len;
+  if (limit > len) {
+    limit = len;
+  }
+
+  for (uint8_t i = 2; i < limit; ++i) {
+    memModule->data[i] = data[i];
+  }
+
+  bsiPersistMemModule(*memModule);
+  if (memModule->enabled) {
+    bsiSendModule(*memModule);
+  }
 }
 
 static void bsiHandle15B(const uint8_t *data, uint8_t len) {
@@ -386,6 +502,14 @@ static void bsiTick() {
   if (now - lastBsi276 >= BSI_PERIOD_276_MS) {
     bsiSend276();
   }
+  for (size_t i = 0; i < kBsiModuleCount; ++i) {
+    BsiModuleConfig &module = bsiModules[i];
+    if (!module.enabled) continue;
+    if (module.periodMs == 0) continue;
+    if (now - module.lastSent >= module.periodMs) {
+      bsiSendModule(module);
+    }
+  }
 }
 
 static String iso8601FromTm(const struct tm &tmv) {
@@ -457,6 +581,10 @@ static void readCanMessages() {
     // 0x128 - Напряжение (D5: * 10)
     if (msg.identifier == 0x128 && msg.data_length_code >= 6) {
       batteryVolt = (float)msg.data[5] / 10.0f;
+    }
+
+    if (msg.identifier == CAN_ID_01C && msg.data_length_code > 0) {
+      bsiHandle01C(msg.data, msg.data_length_code);
     }
 
     if (msg.identifier == CAN_ID_15B && msg.data_length_code > 0) {
@@ -589,7 +717,7 @@ static void updateDisplay() {
 
 // --------- HTML ----------
 static String page() {
-  String s; s.reserve(6500);
+  String s; s.reserve(8000);
   s += F("<!doctype html><html lang='ru'><head><meta charset='utf-8'/>"
          "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
          "<title>PSA CAN Remote</title>"
@@ -620,14 +748,15 @@ static String page() {
          ".row{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px;}"
          ".row button{flex:1 1 140px;}"
          "footer{color:#64748b;font-size:12px;text-align:center;padding:16px 0;}</style>"
-         "<script>let blSlider=null,blLock=false,prefLock=false,timeInput=null;"
+         "<script>let blSlider=null,blLock=false,prefLock=false,timeInput=null,moduleCheckboxes=[];"
          "function updateBrightnessLabel(v){document.getElementById('brightnessPct').innerText=Math.round(v/255*100)+'%';}"
          "function formatUptime(secs){secs=Number(secs||0);if(secs<0)secs=0;const h=Math.floor(secs/3600);const m=Math.floor((secs%3600)/60);const s=Math.floor(secs%60);let parts=[];if(h)parts.push(h+' ч');if(m||h)parts.push(m+' м');parts.push(s+' с');return parts.join(' ');}"
          "async function refresh(){try{let r=await fetch('/data');if(!r.ok)return;let d=await r.json();const tempVal=(typeof d.temp==='number')?d.temp.toFixed(1):d.temp;document.getElementById('temp').innerText=tempVal+(d.isC?'°C':'°F');"
-         "const voltVal=(typeof d.volt==='number')?d.volt.toFixed(1):d.volt;document.getElementById('volt').innerText=voltVal+'V';document.getElementById('speed').innerText=d.speed||'---';document.getElementById('ip').innerText=d.ip||'—';document.getElementById('timeNow').innerText=(d.time||'--').replace('T',' ');document.getElementById('uptime').innerText=formatUptime(d.uptime);const badge=document.getElementById('canBadge');if(badge){badge.innerText=d.canOk?'CAN онлайн':'CAN нет данных';badge.className='badge '+(d.canOk?'ok':'err');}if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}if(!prefLock){const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24)is24.checked=!!d.is24;if(isc)isc.checked=!!d.isC;}if(timeInput&&document.activeElement!==timeInput&&d.time){let v=d.time.length>=16?d.time.substring(0,16):d.time;timeInput.value=v;}}catch(e){console.error(e);}}"
-         "function init(){blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}timeInput=document.getElementById('timeInput');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24){is24.addEventListener('change',()=>updatePref('is24',is24.checked));}if(isc){isc.addEventListener('change',()=>updatePref('isc',isc.checked));}refresh();setInterval(refresh,1500);}"
+         "const voltVal=(typeof d.volt==='number')?d.volt.toFixed(1):d.volt;document.getElementById('volt').innerText=voltVal+'V';document.getElementById('speed').innerText=d.speed||'---';document.getElementById('ip').innerText=d.ip||'—';document.getElementById('timeNow').innerText=(d.time||'--').replace('T',' ');document.getElementById('uptime').innerText=formatUptime(d.uptime);const badge=document.getElementById('canBadge');if(badge){badge.innerText=d.canOk?'CAN онлайн':'CAN нет данных';badge.className='badge '+(d.canOk?'ok':'err');}if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}if(!prefLock){const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24)is24.checked=!!d.is24;if(isc)isc.checked=!!d.isC;}if(timeInput&&document.activeElement!==timeInput&&d.time){let v=d.time.length>=16?d.time.substring(0,16):d.time;timeInput.value=v;}if(moduleCheckboxes.length&&d.modules){moduleCheckboxes.forEach(cb=>{const key=cb.dataset.module;if(key&&Object.prototype.hasOwnProperty.call(d.modules,key)){cb.checked=!!d.modules[key];}});}}catch(e){console.error(e);}}"
+         "function init(){blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}timeInput=document.getElementById('timeInput');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24){is24.addEventListener('change',()=>updatePref('is24',is24.checked));}if(isc){isc.addEventListener('change',()=>updatePref('isc',isc.checked));}moduleCheckboxes=Array.from(document.querySelectorAll('[data-module]'));moduleCheckboxes.forEach(cb=>{cb.addEventListener('change',()=>updateModule(cb.dataset.module,cb.checked));});refresh();setInterval(refresh,1500);}"
          "async function setBrightness(v){try{let r=await fetch('/brightness?value='+v);if(!r.ok)throw new Error();}catch(e){alert('Не удалось обновить подсветку');}}"
          "async function updatePref(name,val){prefLock=true;try{let r=await fetch('/prefs?'+name+'='+(val?'1':'0'));if(!r.ok)throw new Error();}catch(e){alert('Не удалось сохранить настройки');}finally{prefLock=false;}}"
+         "async function updateModule(id,val){try{let r=await fetch('/modules?id='+encodeURIComponent(id)+'&value='+(val?'1':'0'));if(!r.ok)throw new Error();}catch(e){alert('Не удалось изменить состояние модуля');refresh();}}"
          "function pad2(n){return n.toString().padStart(2,'0');}"
          "function isoLocalNow(){const d=new Date();return d.getFullYear()+'-'+pad2(d.getMonth()+1)+'-'+pad2(d.getDate())+'T'+pad2(d.getHours())+':'+pad2(d.getMinutes())+':'+pad2(d.getSeconds());}"
          "async function syncTime(){const iso=isoLocalNow();try{let r=await fetch('/time?iso='+encodeURIComponent(iso));if(!r.ok)throw new Error();refresh();}catch(e){alert('Не удалось синхронизировать время');}}"
@@ -661,6 +790,18 @@ static String page() {
          "<div class='toggle'><input type='checkbox' id='is24'/><label for='is24'>24-часовой формат времени</label></div>"
          "<div class='toggle'><input type='checkbox' id='isc'/><label for='isc'>Температура в градусах Цельсия</label></div>"
          "<p class='small'>Параметры мгновенно применяются к эмуляции BSI и сохраняются в памяти.</p>"
+         "</div>");
+
+  s += F("<div class='card'>"
+         "<h3>Эмуляция BSI для SMEG+</h3>"
+         "<p class='small'>Включите необходимые Comfort CAN пакеты, связанные с головным устройством и дисплеем.</p>"
+         "<div class='toggle'><input type='checkbox' id='mod361' data-module='361'/><label for='mod361'>0x361 — Доступные опции конфигурации</label></div>"
+         "<div class='toggle'><input type='checkbox' id='mod228' data-module='228'/><label for='mod228'>0x228 — Состояние круиз-контроля</label></div>"
+         "<div class='toggle'><input type='checkbox' id='mod1e7' data-module='1e7'/><label for='mod1e7'>0x1E7 — Индикатор дистанции до цели</label></div>"
+         "<div class='toggle'><input type='checkbox' id='mod1e8' data-module='1e8'/><label for='mod1e8'>0x1E8 — Память предустановленных скоростей</label></div>"
+         "<div class='toggle'><input type='checkbox' id='mod2a8' data-module='2a8'/><label for='mod2a8'>0x2A8 — Интеллектуальный регулятор скорости</label></div>"
+         "<div class='toggle'><input type='checkbox' id='mod227' data-module='227'/><label for='mod227'>0x227 — Индикация кнопок ассистентов</label></div>"
+         "<div class='toggle'><input type='checkbox' id='mod2ad' data-module='2ad'/><label for='mod2ad'>0x2AD — Периферийные данные климата</label></div>"
          "</div>");
 
   s += F("<div class='card'>"
@@ -732,6 +873,17 @@ static void handleData() {
   json += canOk ? "true" : "false";
   json += ",\"uptime\":";
   json += String((uint32_t)(millis() / 1000u));
+  json += ",\"modules\":{";
+  for (size_t i = 0; i < kBsiModuleCount; ++i) {
+    if (i > 0) json += ",";
+    char idBuf[10];
+    snprintf(idBuf, sizeof(idBuf), "%lx", (unsigned long)bsiModules[i].id);
+    json += "\"";
+    json += idBuf;
+    json += "\":";
+    json += bsiModules[i].enabled ? "true" : "false";
+  }
+  json += "}";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -826,6 +978,43 @@ static void handlePrefs() {
   server.send(200, "text/plain", "OK");
 }
 
+static void handleModules() {
+  if (!server.hasArg("id") || !server.hasArg("value")) {
+    server.send(400, "text/plain", "Missing params");
+    return;
+  }
+
+  String idStr = server.arg("id");
+  idStr.toLowerCase();
+  char *endPtr = nullptr;
+  uint32_t id = static_cast<uint32_t>(strtoul(idStr.c_str(), &endPtr, 16));
+  if (endPtr == idStr.c_str() || (endPtr && *endPtr != '\0')) {
+    server.send(400, "text/plain", "Invalid id");
+    return;
+  }
+
+  BsiModuleConfig *module = bsiFindModule(id);
+  if (!module) {
+    server.send(404, "text/plain", "Unknown module");
+    return;
+  }
+
+  bool enable = server.arg("value") != "0";
+  if (module->enabled != enable) {
+    module->enabled = enable;
+    if (module->prefKey) {
+      prefs.putBool(module->prefKey, module->enabled);
+    }
+    if (module->enabled) {
+      bsiSendModule(*module);
+    } else {
+      module->lastSent = millis();
+    }
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
 static void handleTime() {
   time_t epoch = 0;
   bool ok = false;
@@ -899,6 +1088,7 @@ void setup() {
   server.on("/brightness", HTTP_GET, handleBrightness);
   server.on("/cfg", HTTP_GET, handleCfg);
   server.on("/prefs", HTTP_GET, handlePrefs);
+  server.on("/modules", HTTP_GET, handleModules);
   server.on("/time", HTTP_GET, handleTime);
   server.begin();
   Serial.println("[HTTP] Server started on :80");
