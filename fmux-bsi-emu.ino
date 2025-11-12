@@ -76,9 +76,7 @@ static uint16_t lastCanColor = 0;
 static uint8_t brightnessSetting = 153; // desired brightness 0-255 (≈60%)
 static uint8_t brightnessApplied = 0;   // actual backlight level
 static bool lampsOn = false;
-static bool displaySuspended = false;
 static bool wifiActive = false;
-static bool energySavingEnabled = false;
 static bool ignitionOn = true;
 static unsigned long lastIgnitionFrame = 0;
 static unsigned long lastLampsFrame = 0;
@@ -91,7 +89,6 @@ static constexpr const char* kPrefIsC = "isc";
 static constexpr const char* kPrefRaw260 = "raw260";
 static constexpr const char* kPrefEpoch = "epoch";
 static constexpr const char* kPrefEpochTs = "epoch_ts";
-static constexpr const char* kPrefEnergySaving = "energy";
 
 static constexpr unsigned long IGNITION_TIMEOUT_MS = 2000;
 static constexpr unsigned long LAMPS_TIMEOUT_MS = 3000;
@@ -131,7 +128,6 @@ static void invalidateDisplayCache();
 static void setWifiActive(bool on);
 static uint8_t computeEffectiveBrightness();
 static void refreshBacklight();
-static void updatePowerState();
 static void setIgnition(bool value);
 static void setLamps(bool value);
 
@@ -141,10 +137,6 @@ static void applyBacklight(uint8_t value) {
 }
 
 static uint8_t computeEffectiveBrightness() {
-  if (energySavingEnabled && !ignitionOn) {
-    return 0;
-  }
-
   uint8_t target = brightnessSetting;
   if (lampsOn && target > 0) {
     uint32_t dimmed = static_cast<uint32_t>(target) * DIMMING_PERCENT;
@@ -179,29 +171,10 @@ static void setWifiActive(bool on) {
   }
 }
 
-static void updatePowerState() {
-  bool shouldBeOn = !energySavingEnabled || ignitionOn;
-
-  if (shouldBeOn) {
-    if (displaySuspended) {
-      displaySuspended = false;
-      invalidateDisplayCache();
-    }
-  } else {
-    if (!displaySuspended) {
-      displaySuspended = true;
-    }
-  }
-
-  refreshBacklight();
-  setWifiActive(shouldBeOn);
-}
-
 static void setIgnition(bool value) {
   if (value != ignitionOn) {
     ignitionOn = value;
     Serial.printf("[POWER] Ignition %s\n", ignitionOn ? "ON" : "OFF");
-    updatePowerState();
   }
 }
 
@@ -666,8 +639,6 @@ static void drawField(int x, int y, int w, int h, uint8_t textSize,
 
 static void updateDisplay() {
   unsigned long now = millis();
-  if (energySavingEnabled && displaySuspended) return;
-  if (energySavingEnabled && !ignitionOn) return;
   if (now - lastDisplayUpdate < 150) return;
   lastDisplayUpdate = now;
 
@@ -771,8 +742,8 @@ static String page() {
          "function formatUptime(secs){secs=Number(secs||0);if(secs<0)secs=0;const h=Math.floor(secs/3600);const m=Math.floor((secs%3600)/60);const s=Math.floor(secs%60);let parts=[];if(h)parts.push(h+' ч');if(m||h)parts.push(m+' м');parts.push(s+' с');return parts.join(' ');}"
          "async function refresh(){try{let r=await fetch('/data');if(!r.ok)return;let d=await r.json();const tempVal=(typeof d.temp==='number')?d.temp.toFixed(1):d.temp;document.getElementById('temp').innerText=tempVal+(d.isC?'°C':'°F');"
          "const iatVal=(typeof d.iat==='number')?d.iat.toFixed(1):d.iat;document.getElementById('iat').innerText=iatVal+(d.isC?'°C':'°F');"
-         "const voltVal=(typeof d.volt==='number')?d.volt.toFixed(1):d.volt;document.getElementById('volt').innerText=voltVal+'V';document.getElementById('speed').innerText=d.speed||'---';document.getElementById('ip').innerText=d.ip||'—';document.getElementById('timeNow').innerText=(d.time||'--').replace('T',' ');document.getElementById('uptime').innerText=formatUptime(d.uptime);const badge=document.getElementById('canBadge');if(badge){badge.innerText=d.canOk?'CAN онлайн':'CAN нет данных';badge.className='badge '+(d.canOk?'ok':'err');}if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}if(!prefLock){const energy=document.getElementById('energy');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(energy)energy.checked=!!d.energy;if(is24)is24.checked=!!d.is24;if(isc)isc.checked=!!d.isC;}if(timeInput&&document.activeElement!==timeInput&&d.time){let v=d.time.length>=16?d.time.substring(0,16):d.time;timeInput.value=v;}}catch(e){console.error(e);}}"
-         "function init(){blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}timeInput=document.getElementById('timeInput');const energy=document.getElementById('energy');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(energy){energy.addEventListener('change',()=>updatePref('energy',energy.checked));}if(is24){is24.addEventListener('change',()=>updatePref('is24',is24.checked));}if(isc){isc.addEventListener('change',()=>updatePref('isc',isc.checked));}refresh();setInterval(refresh,1500);}"
+        "const voltVal=(typeof d.volt==='number')?d.volt.toFixed(1):d.volt;document.getElementById('volt').innerText=voltVal+'V';document.getElementById('speed').innerText=d.speed||'---';document.getElementById('ip').innerText=d.ip||'—';document.getElementById('timeNow').innerText=(d.time||'--').replace('T',' ');document.getElementById('uptime').innerText=formatUptime(d.uptime);const badge=document.getElementById('canBadge');if(badge){badge.innerText=d.canOk?'CAN онлайн':'CAN нет данных';badge.className='badge '+(d.canOk?'ok':'err');}if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}if(!prefLock){const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24)is24.checked=!!d.is24;if(isc)isc.checked=!!d.isC;}if(timeInput&&document.activeElement!==timeInput&&d.time){let v=d.time.length>=16?d.time.substring(0,16):d.time;timeInput.value=v;}}catch(e){console.error(e);}}"
+         "function init(){blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}timeInput=document.getElementById('timeInput');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24){is24.addEventListener('change',()=>updatePref('is24',is24.checked));}if(isc){isc.addEventListener('change',()=>updatePref('isc',isc.checked));}refresh();setInterval(refresh,1500);}"
          "async function setBrightness(v){try{let r=await fetch('/brightness?value='+v);if(!r.ok)throw new Error();}catch(e){alert('Не удалось обновить подсветку');}}"
          "async function updatePref(name,val){prefLock=true;try{let r=await fetch('/prefs?'+name+'='+(val?'1':'0'));if(!r.ok)throw new Error();}catch(e){alert('Не удалось сохранить настройки');}finally{prefLock=false;}}"
          "function pad2(n){return n.toString().padStart(2,'0');}"
@@ -806,9 +777,8 @@ static String page() {
 
   s += F("<div class='card'>"
          "<h3>Настройки отображения</h3>"
-         "<div class='toggle'><input type='checkbox' id='energy'/><label for='energy'>Энергосбережение по зажиганию</label></div>"
-         "<div class='toggle'><input type='checkbox' id='is24'/><label for='is24'>24-часовой формат времени</label></div>"
-         "<div class='toggle'><input type='checkbox' id='isc'/><label for='isc'>Температура в градусах Цельсия</label></div>"
+        "<div class='toggle'><input type='checkbox' id='is24'/><label for='is24'>24-часовой формат времени</label></div>"
+        "<div class='toggle'><input type='checkbox' id='isc'/><label for='isc'>Температура в градусах Цельсия</label></div>"
          "<p class='small'>Параметры мгновенно применяются к эмуляции BSI и сохраняются в памяти.</p>"
          "</div>");
 
@@ -889,8 +859,6 @@ static void handleData() {
   json += ",\"canOk\":";
   bool canOk = (millis() - lastCanRx) < 2000u;
   json += canOk ? "true" : "false";
-  json += ",\"energy\":";
-  json += energySavingEnabled ? "true" : "false";
   json += ",\"ignition\":";
   json += ignitionOn ? "true" : "false";
   json += ",\"uptime\":";
@@ -957,7 +925,6 @@ static void handlePrefs() {
   bool changed = false;
   bool need260 = false;
   bool need276 = false;
-  bool energyChanged = false;
 
   if (server.hasArg("is24")) {
     bool newVal = server.arg("is24") != "0";
@@ -977,16 +944,6 @@ static void handlePrefs() {
     }
   }
 
-  if (server.hasArg("energy")) {
-    bool newVal = server.arg("energy") != "0";
-    if (newVal != energySavingEnabled) {
-      energySavingEnabled = newVal;
-      energyChanged = true;
-      prefs.putBool(kPrefEnergySaving, energySavingEnabled);
-      updatePowerState();
-    }
-  }
-
   if (changed) {
     bsiSaveState();
     if (need260) {
@@ -995,11 +952,6 @@ static void handlePrefs() {
     if (need276) {
       bsiSend276();
     }
-  }
-
-  if (!energyChanged && (server.hasArg("energy"))) {
-    // Persist state even if unchanged to ensure consistency.
-    prefs.putBool(kPrefEnergySaving, energySavingEnabled);
   }
 
   server.send(200, "text/plain", "OK");
@@ -1048,11 +1000,8 @@ void setup() {
 
   prefs.begin(kPrefsNamespace, false);
   brightnessSetting = prefs.getUChar(kPrefBrightness, brightnessSetting);
-  energySavingEnabled = prefs.getBool(kPrefEnergySaving, energySavingEnabled);
-  ignitionOn = !energySavingEnabled;
-  Serial.printf("[POWER] Energy saving %s\n", energySavingEnabled ? "ENABLED" : "DISABLED");
   refreshBacklight();
-  updatePowerState();
+  setWifiActive(true);
   bsiLoadState();
 
   if (CAN_STANDBY_PIN >= 0) {
@@ -1067,7 +1016,7 @@ void setup() {
   gfx->setCursor(20, 60);
   gfx->println("Starting...");
 
-  // Wi-Fi state already set by updatePowerState()
+  // Wi-Fi AP already started
 
   // CAN
   if (!twaiStart()) Serial.println("[CAN] init failed");
@@ -1092,10 +1041,8 @@ void loop() {
   server.handleClient();
   readCanMessages();
   unsigned long now = millis();
-  if (energySavingEnabled) {
-    if (now - lastIgnitionFrame > IGNITION_TIMEOUT_MS) {
-      setIgnition(false);
-    }
+  if (now - lastIgnitionFrame > IGNITION_TIMEOUT_MS) {
+    setIgnition(false);
   }
   if (lampsOn && (now - lastLampsFrame > LAMPS_TIMEOUT_MS)) {
     setLamps(false);
