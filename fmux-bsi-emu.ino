@@ -557,17 +557,17 @@ static void readCanMessages() {
       }
     }
 
-    // 0x128 - Статусы (зажигание в бите 7 первого байта)
+    // 0x128 - Статусы (зажигание/+ACC в битах 6-7 первого байта)
     if (msg.identifier == 0x128) {
       if (msg.data_length_code >= 1) {
-        bool ign = (msg.data[0] & 0x80u) != 0;
+        bool ign = (msg.data[0] & 0xC0u) != 0;
         lastIgnitionFrame = millis();
         setIgnition(ign);
       }
     }
 
     if (msg.identifier == 0x0A8 && msg.data_length_code >= 3) {
-      bool ign = (msg.data[2] & 0x80u) != 0;
+      bool ign = (msg.data[2] & 0xC0u) != 0;
       lastIgnitionFrame = millis();
       setIgnition(ign);
     }
