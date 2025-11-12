@@ -57,6 +57,7 @@ enum class CanBitrate : uint8_t { k125k = 0 };
 static bool canStarted = false;
 static CanBitrate currentBitrate = CanBitrate::k125k;
 static float engineTemp = -99.0f;
+static float intakeAirTemp = -99.0f;
 static float batteryVolt = 0.0f;
 static unsigned long lastCanRx = 0;
 static unsigned long lastDisplayUpdate = 0;
@@ -65,9 +66,11 @@ static unsigned long lastBsi276 = 0;
 // --------- Display cache / brightness ----------
 static bool uiInitialized = false;
 static String lastTempText;
+static String lastIatText;
 static String lastVoltText;
 static String lastCanText;
 static uint16_t lastTempColor = 0;
+static uint16_t lastIatColor = 0;
 static uint16_t lastVoltColor = 0;
 static uint16_t lastCanColor = 0;
 static uint8_t brightnessSetting = 153; // desired brightness 0-255 (≈60%)
@@ -254,6 +257,7 @@ static bool twaiReconfigure(CanBitrate b) {
   currentBitrate = b;
   lastCanRx = 0;
   engineTemp = -99.0f;
+  intakeAirTemp = -99.0f;
   batteryVolt = 0.0f;
   invalidateDisplayCache();
   unsigned long now = millis();
@@ -528,17 +532,33 @@ static void readCanMessages() {
   while (twai_receive(&msg, 0) == ESP_OK) {
     lastCanRx = millis();
     
-    // Peugeot 307 (2006) Comfort CAN:
-    // 0x0F6 - Температура двигателя (D0: -40°C offset)
-    if (msg.identifier == 0x0F6 && msg.data_length_code >= 1) {
-      engineTemp = (float)msg.data[0] - 40.0f;
+    // Peugeot 308 Comfort CAN (AEE2004):
+    // 0x0F6 - Температура воздуха на впуске и ОЖ (байты 0 и 1 со смещением -39°C)
+    if (msg.identifier == 0x0F6) {
+      if (msg.data_length_code >= 1) {
+        intakeAirTemp = (float)msg.data[0] - 39.0f;
+      }
+      if (msg.data_length_code >= 2) {
+        engineTemp = (float)msg.data[1] - 39.0f;
+      }
     }
 
-    // 0x128 - Напряжение (D5: * 10)
-    if (msg.identifier == 0x128) {
+    // 0x0E6 - Напряжение АКБ (байт 5 в децивольтах, иногда байт 6)
+    if (msg.identifier == 0x0E6) {
+      float rawDecivolt = -1.0f;
       if (msg.data_length_code >= 6) {
-        batteryVolt = (float)msg.data[5] / 10.0f;
+        rawDecivolt = static_cast<float>(msg.data[5]);
       }
+      if ((rawDecivolt <= 0.0f || rawDecivolt == 255.0f) && msg.data_length_code >= 7) {
+        rawDecivolt = static_cast<float>(msg.data[6]);
+      }
+      if (rawDecivolt >= 0.0f) {
+        batteryVolt = rawDecivolt / 10.0f;
+      }
+    }
+
+    // 0x128 - Статусы (зажигание в бите 7 первого байта)
+    if (msg.identifier == 0x128) {
       if (msg.data_length_code >= 1) {
         bool ign = (msg.data[0] & 0x80u) != 0;
         lastIgnitionFrame = millis();
@@ -570,24 +590,30 @@ static void readCanMessages() {
 
 // --------- Display Update ----------
 static constexpr int TEMP_X = 60;
-static constexpr int TEMP_Y = 50;
+static constexpr int TEMP_Y = 40;
 static constexpr int TEMP_W = 112;
 static constexpr int TEMP_H = 24;
+static constexpr int IAT_X  = 60;
+static constexpr int IAT_Y  = 80;
+static constexpr int IAT_W  = 112;
+static constexpr int IAT_H  = 24;
 static constexpr int VOLT_X = 60;
-static constexpr int VOLT_Y = 90;
+static constexpr int VOLT_Y = 120;
 static constexpr int VOLT_W = 112;
 static constexpr int VOLT_H = 24;
 static constexpr int CAN_X  = 60;
-static constexpr int CAN_Y  = 130;
+static constexpr int CAN_Y  = 160;
 static constexpr int CAN_W  = 112;
 static constexpr int CAN_H  = 10;
 
 static void invalidateDisplayCache() {
   uiInitialized = false;
   lastTempText = "";
+  lastIatText = "";
   lastVoltText = "";
   lastCanText = "";
   lastTempColor = 0;
+  lastIatColor = 0;
   lastVoltColor = 0;
   lastCanColor = 0;
 }
@@ -604,16 +630,20 @@ static void drawStaticUi() {
 
   gfx->setTextSize(3);
   gfx->setTextColor(CYAN);
-  gfx->setCursor(10, 50);
-  gfx->print("T:");
+  gfx->setCursor(10, 40);
+  gfx->print("ENG:");
+
+  gfx->setTextColor(BLUE);
+  gfx->setCursor(10, 80);
+  gfx->print("AIR:");
 
   gfx->setTextColor(ORANGE);
-  gfx->setCursor(10, 90);
+  gfx->setCursor(10, 120);
   gfx->print("V:");
 
   gfx->setTextSize(1);
   gfx->setTextColor(WHITE);
-  gfx->setCursor(10, 130);
+  gfx->setCursor(10, 160);
   gfx->print("CAN:");
 
   uiInitialized = true;
@@ -661,6 +691,21 @@ static void updateDisplay() {
   }
   drawField(TEMP_X, TEMP_Y, TEMP_W, TEMP_H, 3, tempText, tempColor,
             lastTempText, lastTempColor);
+
+  String iatText;
+  uint16_t iatColor;
+  if (intakeAirTemp > -90.0f) {
+    snprintf(buf, sizeof(buf), "%.0fC", intakeAirTemp);
+    iatText = String(buf);
+    if (intakeAirTemp < 40.0f) iatColor = CYAN;
+    else if (intakeAirTemp < 65.0f) iatColor = YELLOW;
+    else iatColor = RED;
+  } else {
+    iatText = F("---");
+    iatColor = DARKGREY;
+  }
+  drawField(IAT_X, IAT_Y, IAT_W, IAT_H, 3, iatText, iatColor,
+            lastIatText, lastIatColor);
 
   String voltText;
   uint16_t voltColor;
@@ -725,6 +770,7 @@ static String page() {
          "function updateBrightnessLabel(v){document.getElementById('brightnessPct').innerText=Math.round(v/255*100)+'%';}"
          "function formatUptime(secs){secs=Number(secs||0);if(secs<0)secs=0;const h=Math.floor(secs/3600);const m=Math.floor((secs%3600)/60);const s=Math.floor(secs%60);let parts=[];if(h)parts.push(h+' ч');if(m||h)parts.push(m+' м');parts.push(s+' с');return parts.join(' ');}"
          "async function refresh(){try{let r=await fetch('/data');if(!r.ok)return;let d=await r.json();const tempVal=(typeof d.temp==='number')?d.temp.toFixed(1):d.temp;document.getElementById('temp').innerText=tempVal+(d.isC?'°C':'°F');"
+         "const iatVal=(typeof d.iat==='number')?d.iat.toFixed(1):d.iat;document.getElementById('iat').innerText=iatVal+(d.isC?'°C':'°F');"
          "const voltVal=(typeof d.volt==='number')?d.volt.toFixed(1):d.volt;document.getElementById('volt').innerText=voltVal+'V';document.getElementById('speed').innerText=d.speed||'---';document.getElementById('ip').innerText=d.ip||'—';document.getElementById('timeNow').innerText=(d.time||'--').replace('T',' ');document.getElementById('uptime').innerText=formatUptime(d.uptime);const badge=document.getElementById('canBadge');if(badge){badge.innerText=d.canOk?'CAN онлайн':'CAN нет данных';badge.className='badge '+(d.canOk?'ok':'err');}if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}if(!prefLock){const energy=document.getElementById('energy');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(energy)energy.checked=!!d.energy;if(is24)is24.checked=!!d.is24;if(isc)isc.checked=!!d.isC;}if(timeInput&&document.activeElement!==timeInput&&d.time){let v=d.time.length>=16?d.time.substring(0,16):d.time;timeInput.value=v;}}catch(e){console.error(e);}}"
          "function init(){blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}timeInput=document.getElementById('timeInput');const energy=document.getElementById('energy');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(energy){energy.addEventListener('change',()=>updatePref('energy',energy.checked));}if(is24){is24.addEventListener('change',()=>updatePref('is24',is24.checked));}if(isc){isc.addEventListener('change',()=>updatePref('isc',isc.checked));}refresh();setInterval(refresh,1500);}"
          "async function setBrightness(v){try{let r=await fetch('/brightness?value='+v);if(!r.ok)throw new Error();}catch(e){alert('Не удалось обновить подсветку');}}"
@@ -741,6 +787,7 @@ static String page() {
          "<p class='small'>ESP32-C6 Comfort CAN контроллер. IP точки доступа: <strong id='ip'>--</strong></p>"
          "<div class='metrics'>"
          "<div class='metric'><div class='label'>Температура двигателя</div><div class='value' id='temp'>--°C</div></div>"
+         "<div class='metric'><div class='label'>Температура воздуха на впуске</div><div class='value' id='iat'>--°C</div></div>"
          "<div class='metric'><div class='label'>Напряжение</div><div class='value' id='volt'>--V</div></div>"
          "<div class='metric'><div class='label'>CAN скорость</div><div class='value' id='speed'>---</div></div>"
          "<div class='metric'><div class='label'>Аптайм</div><div class='value' id='uptime'>--</div></div>"
@@ -805,6 +852,16 @@ static void handleData() {
   String json = "{\"temp\":";
   if (engineTemp > -90.0f) {
     float value = engineTemp;
+    if (!bsiIsCelsius) {
+      value = value * 9.0f / 5.0f + 32.0f;
+    }
+    json += String(value, 1);
+  } else {
+    json += "\"---\"";
+  }
+  json += ",\"iat\":";
+  if (intakeAirTemp > -90.0f) {
+    float value = intakeAirTemp;
     if (!bsiIsCelsius) {
       value = value * 9.0f / 5.0f + 32.0f;
     }
