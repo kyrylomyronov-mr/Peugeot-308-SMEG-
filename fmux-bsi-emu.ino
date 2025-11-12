@@ -74,9 +74,9 @@ static uint16_t lastIatColor = 0;
 static uint16_t lastVoltColor = 0;
 static uint16_t lastCanColor = 0;
 static uint8_t brightnessSetting = 153; // desired brightness 0-255 (≈60%)
-static uint8_t brightnessApplied = 0;   // actual backlight level
 static bool lampsOn = false;
 static bool wifiActive = false;
+static String wifiIp;
 static bool ignitionOn = true;
 static unsigned long lastIgnitionFrame = 0;
 static unsigned long lastLampsFrame = 0;
@@ -93,6 +93,9 @@ static constexpr const char* kPrefEpochTs = "epoch_ts";
 static constexpr unsigned long IGNITION_TIMEOUT_MS = 2000;
 static constexpr unsigned long LAMPS_TIMEOUT_MS = 3000;
 static constexpr uint8_t DIMMING_PERCENT = 35; // % of user brightness when lamps on
+static constexpr float INVALID_TEMP = -90.0f;
+static constexpr float MIN_VALID_VOLT = 5.0f;
+static constexpr unsigned long CAN_STALE_TIMEOUT_MS = 2000u;
 
 // --------- BSI emulator state ----------
 static constexpr uint32_t CAN_ID_260 = 0x260; // BSI broadcast settings
@@ -131,10 +134,7 @@ static void refreshBacklight();
 static void setIgnition(bool value);
 static void setLamps(bool value);
 
-static void applyBacklight(uint8_t value) {
-  brightnessApplied = value;
-  analogWrite(TFT_BL, brightnessApplied);
-}
+static void applyBacklight(uint8_t value) { analogWrite(TFT_BL, value); }
 
 static uint8_t computeEffectiveBrightness() {
   uint8_t target = brightnessSetting;
@@ -159,13 +159,15 @@ static void setWifiActive(bool on) {
       WiFi.mode(WIFI_AP);
       WiFi.softAP(AP_SSID, AP_PASS);
       wifiActive = true;
-      Serial.printf("[WiFi] AP: %s, IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+      wifiIp = WiFi.softAPIP().toString();
+      Serial.printf("[WiFi] AP: %s, IP: %s\n", AP_SSID, wifiIp.c_str());
     }
   } else {
     if (wifiActive) {
       WiFi.softAPdisconnect(true);
       WiFi.mode(WIFI_OFF);
       wifiActive = false;
+      wifiIp = String();
       Serial.println("[WiFi] AP disabled");
     }
   }
@@ -637,12 +639,15 @@ static void drawField(int x, int y, int w, int h, uint8_t textSize,
   lastColor = color;
 }
 
+static bool hasValidTemp(float value) { return value > INVALID_TEMP; }
+static bool hasValidVoltage(float value) { return value > MIN_VALID_VOLT; }
+
 static void updateDisplay() {
   unsigned long now = millis();
   if (now - lastDisplayUpdate < 150) return;
   lastDisplayUpdate = now;
 
-  bool canOk = (now - lastCanRx < 2000);
+  bool canOk = (now - lastCanRx < CAN_STALE_TIMEOUT_MS);
 
   drawStaticUi();
 
@@ -650,7 +655,7 @@ static void updateDisplay() {
 
   String tempText;
   uint16_t tempColor;
-  if (engineTemp > -90.0f) {
+  if (hasValidTemp(engineTemp)) {
     snprintf(buf, sizeof(buf), "%.0fC", engineTemp);
     tempText = String(buf);
     if (engineTemp < 80.0f) tempColor = GREEN;
@@ -665,7 +670,7 @@ static void updateDisplay() {
 
   String iatText;
   uint16_t iatColor;
-  if (intakeAirTemp > -90.0f) {
+  if (hasValidTemp(intakeAirTemp)) {
     snprintf(buf, sizeof(buf), "%.0fC", intakeAirTemp);
     iatText = String(buf);
     if (intakeAirTemp < 40.0f) iatColor = CYAN;
@@ -680,7 +685,7 @@ static void updateDisplay() {
 
   String voltText;
   uint16_t voltColor;
-  if (batteryVolt > 5.0f) {
+  if (hasValidVoltage(batteryVolt)) {
     snprintf(buf, sizeof(buf), "%.1fV", batteryVolt);
     voltText = String(buf);
     if (batteryVolt >= 12.5f) voltColor = GREEN;
@@ -814,56 +819,77 @@ static String page() {
 }
 
 // --------- HTTP ----------
-static void handleRoot() { 
-  server.send(200, "text/html; charset=utf-8", page()); 
+static void handleRoot() {
+  server.send(200, "text/html; charset=utf-8", page());
+}
+
+static float displayTemp(float value) {
+  return bsiIsCelsius ? value : (value * 9.0f / 5.0f + 32.0f);
+}
+
+static void appendTempJson(String &json, const char *key, float value) {
+  json += '"';
+  json += key;
+  json += '"';
+  json += ':';
+  if (hasValidTemp(value)) {
+    json += String(displayTemp(value), 1);
+  } else {
+    json += F("\"---\"");
+  }
 }
 
 static void handleData() {
-  String json = "{\"temp\":";
-  if (engineTemp > -90.0f) {
-    float value = engineTemp;
-    if (!bsiIsCelsius) {
-      value = value * 9.0f / 5.0f + 32.0f;
-    }
-    json += String(value, 1);
+  String json(F("{"));
+  json.reserve(256);
+
+  appendTempJson(json, "temp", engineTemp);
+  json += ',';
+  appendTempJson(json, "iat", intakeAirTemp);
+
+  json += F(",\"volt\":");
+  if (hasValidVoltage(batteryVolt)) {
+    json += String(batteryVolt, 1);
   } else {
-    json += "\"---\"";
+    json += F("\"---\"");
   }
-  json += ",\"iat\":";
-  if (intakeAirTemp > -90.0f) {
-    float value = intakeAirTemp;
-    if (!bsiIsCelsius) {
-      value = value * 9.0f / 5.0f + 32.0f;
-    }
-    json += String(value, 1);
-  } else {
-    json += "\"---\"";
-  }
-  json += ",\"volt\":";
-  json += (batteryVolt > 5.0f) ? String(batteryVolt, 1) : "\"---\"";
-  json += ",\"speed\":\"";
+
+  json += F(",\"speed\":\"");
   json += bitrateName(currentBitrate);
-  json += "\"";
-  json += ",\"brightness\":";
-  json += String((int)brightnessSetting);
-  json += ",\"is24\":";
-  json += bsiIs24h ? "true" : "false";
-  json += ",\"isC\":";
-  json += bsiIsCelsius ? "true" : "false";
-  json += ",\"time\":\"";
+  json += '"';
+
+  json += F(",\"brightness\":");
+  json += String(static_cast<int>(brightnessSetting));
+
+  json += F(",\"is24\":");
+  json += bsiIs24h ? F("true") : F("false");
+
+  json += F(",\"isC\":");
+  json += bsiIsCelsius ? F("true") : F("false");
+
+  json += F(",\"time\":\"");
   json += iso8601Now();
-  json += "\"";
-  json += ",\"ip\":\"";
-  json += wifiActive ? WiFi.softAPIP().toString() : String("--");
-  json += "\"";
-  json += ",\"canOk\":";
-  bool canOk = (millis() - lastCanRx) < 2000u;
-  json += canOk ? "true" : "false";
-  json += ",\"ignition\":";
-  json += ignitionOn ? "true" : "false";
-  json += ",\"uptime\":";
-  json += String((uint32_t)(millis() / 1000u));
-  json += "}";
+  json += '"';
+
+  json += F(",\"ip\":\"");
+  if (wifiActive && wifiIp.length()) {
+    json += wifiIp;
+  } else {
+    json += F("--");
+  }
+  json += '"';
+
+  const bool canOk = (millis() - lastCanRx) < CAN_STALE_TIMEOUT_MS;
+  json += F(",\"canOk\":");
+  json += canOk ? F("true") : F("false");
+
+  json += F(",\"ignition\":");
+  json += ignitionOn ? F("true") : F("false");
+
+  json += F(",\"uptime\":");
+  json += String(static_cast<uint32_t>(millis() / 1000u));
+
+  json += '}';
   server.send(200, "application/json", json);
 }
 
