@@ -70,7 +70,15 @@ static String lastCanText;
 static uint16_t lastTempColor = 0;
 static uint16_t lastVoltColor = 0;
 static uint16_t lastCanColor = 0;
-static uint8_t brightness = 153; // 0-255 (≈60%)
+static uint8_t brightnessSetting = 153; // desired brightness 0-255 (≈60%)
+static uint8_t brightnessApplied = 0;   // actual backlight level
+static bool lampsOn = false;
+static bool displaySuspended = false;
+static bool wifiActive = false;
+static bool energySavingEnabled = false;
+static bool ignitionOn = true;
+static unsigned long lastIgnitionFrame = 0;
+static unsigned long lastLampsFrame = 0;
 static Preferences prefs;
 static constexpr const char* kPrefsNamespace = "psacan";
 static constexpr const char* kPrefBrightness = "brightness";
@@ -80,6 +88,11 @@ static constexpr const char* kPrefIsC = "isc";
 static constexpr const char* kPrefRaw260 = "raw260";
 static constexpr const char* kPrefEpoch = "epoch";
 static constexpr const char* kPrefEpochTs = "epoch_ts";
+static constexpr const char* kPrefEnergySaving = "energy";
+
+static constexpr unsigned long IGNITION_TIMEOUT_MS = 2000;
+static constexpr unsigned long LAMPS_TIMEOUT_MS = 3000;
+static constexpr uint8_t DIMMING_PERCENT = 35; // % of user brightness when lamps on
 
 // --------- BSI emulator state ----------
 static constexpr uint32_t CAN_ID_260 = 0x260; // BSI broadcast settings
@@ -112,10 +125,89 @@ static String iso8601Now();
 static bool parseIso8601(const String &iso, time_t &outEpoch);
 
 static void invalidateDisplayCache();
+static void setWifiActive(bool on);
+static uint8_t computeEffectiveBrightness();
+static void refreshBacklight();
+static void updatePowerState();
+static void setIgnition(bool value);
+static void setLamps(bool value);
 
-static void applyBrightness(uint8_t value) {
-  brightness = value;
-  analogWrite(TFT_BL, brightness);
+static void applyBacklight(uint8_t value) {
+  brightnessApplied = value;
+  analogWrite(TFT_BL, brightnessApplied);
+}
+
+static uint8_t computeEffectiveBrightness() {
+  if (energySavingEnabled && !ignitionOn) {
+    return 0;
+  }
+
+  uint8_t target = brightnessSetting;
+  if (lampsOn && target > 0) {
+    uint32_t dimmed = static_cast<uint32_t>(target) * DIMMING_PERCENT;
+    dimmed /= 100u;
+    if (dimmed == 0) {
+      dimmed = 1;
+    }
+    target = static_cast<uint8_t>(dimmed);
+  }
+  return target;
+}
+
+static void refreshBacklight() {
+  applyBacklight(computeEffectiveBrightness());
+}
+
+static void setWifiActive(bool on) {
+  if (on) {
+    if (!wifiActive) {
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(AP_SSID, AP_PASS);
+      wifiActive = true;
+      Serial.printf("[WiFi] AP: %s, IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+    }
+  } else {
+    if (wifiActive) {
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_OFF);
+      wifiActive = false;
+      Serial.println("[WiFi] AP disabled");
+    }
+  }
+}
+
+static void updatePowerState() {
+  bool shouldBeOn = !energySavingEnabled || ignitionOn;
+
+  if (shouldBeOn) {
+    if (displaySuspended) {
+      displaySuspended = false;
+      invalidateDisplayCache();
+    }
+  } else {
+    if (!displaySuspended) {
+      displaySuspended = true;
+    }
+  }
+
+  refreshBacklight();
+  setWifiActive(shouldBeOn);
+}
+
+static void setIgnition(bool value) {
+  if (value != ignitionOn) {
+    ignitionOn = value;
+    Serial.printf("[POWER] Ignition %s\n", ignitionOn ? "ON" : "OFF");
+    updatePowerState();
+  }
+}
+
+static void setLamps(bool value) {
+  if (value != lampsOn) {
+    lampsOn = value;
+    Serial.printf("[POWER] Lamps %s\n", lampsOn ? "ON" : "OFF");
+    refreshBacklight();
+  }
 }
 
 // --------- CAN Init ----------
@@ -443,8 +535,27 @@ static void readCanMessages() {
     }
 
     // 0x128 - Напряжение (D5: * 10)
-    if (msg.identifier == 0x128 && msg.data_length_code >= 6) {
-      batteryVolt = (float)msg.data[5] / 10.0f;
+    if (msg.identifier == 0x128) {
+      if (msg.data_length_code >= 6) {
+        batteryVolt = (float)msg.data[5] / 10.0f;
+      }
+      if (msg.data_length_code >= 1) {
+        bool ign = (msg.data[0] & 0x80u) != 0;
+        lastIgnitionFrame = millis();
+        setIgnition(ign);
+      }
+    }
+
+    if (msg.identifier == 0x0A8 && msg.data_length_code >= 3) {
+      bool ign = (msg.data[2] & 0x80u) != 0;
+      lastIgnitionFrame = millis();
+      setIgnition(ign);
+    }
+
+    if (msg.identifier == 0x1A8 && msg.data_length_code >= 1) {
+      bool lamps = (msg.data[0] & 0x14u) != 0; // bit2=parking, bit4=low beam
+      lastLampsFrame = millis();
+      setLamps(lamps);
     }
 
     if (msg.identifier == CAN_ID_15B && msg.data_length_code > 0) {
@@ -525,6 +636,8 @@ static void drawField(int x, int y, int w, int h, uint8_t textSize,
 
 static void updateDisplay() {
   unsigned long now = millis();
+  if (energySavingEnabled && displaySuspended) return;
+  if (energySavingEnabled && !ignitionOn) return;
   if (now - lastDisplayUpdate < 150) return;
   lastDisplayUpdate = now;
 
@@ -612,8 +725,8 @@ static String page() {
          "function updateBrightnessLabel(v){document.getElementById('brightnessPct').innerText=Math.round(v/255*100)+'%';}"
          "function formatUptime(secs){secs=Number(secs||0);if(secs<0)secs=0;const h=Math.floor(secs/3600);const m=Math.floor((secs%3600)/60);const s=Math.floor(secs%60);let parts=[];if(h)parts.push(h+' ч');if(m||h)parts.push(m+' м');parts.push(s+' с');return parts.join(' ');}"
          "async function refresh(){try{let r=await fetch('/data');if(!r.ok)return;let d=await r.json();const tempVal=(typeof d.temp==='number')?d.temp.toFixed(1):d.temp;document.getElementById('temp').innerText=tempVal+(d.isC?'°C':'°F');"
-         "const voltVal=(typeof d.volt==='number')?d.volt.toFixed(1):d.volt;document.getElementById('volt').innerText=voltVal+'V';document.getElementById('speed').innerText=d.speed||'---';document.getElementById('ip').innerText=d.ip||'—';document.getElementById('timeNow').innerText=(d.time||'--').replace('T',' ');document.getElementById('uptime').innerText=formatUptime(d.uptime);const badge=document.getElementById('canBadge');if(badge){badge.innerText=d.canOk?'CAN онлайн':'CAN нет данных';badge.className='badge '+(d.canOk?'ok':'err');}if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}if(!prefLock){const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24)is24.checked=!!d.is24;if(isc)isc.checked=!!d.isC;}if(timeInput&&document.activeElement!==timeInput&&d.time){let v=d.time.length>=16?d.time.substring(0,16):d.time;timeInput.value=v;}}catch(e){console.error(e);}}"
-         "function init(){blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}timeInput=document.getElementById('timeInput');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24){is24.addEventListener('change',()=>updatePref('is24',is24.checked));}if(isc){isc.addEventListener('change',()=>updatePref('isc',isc.checked));}refresh();setInterval(refresh,1500);}"
+         "const voltVal=(typeof d.volt==='number')?d.volt.toFixed(1):d.volt;document.getElementById('volt').innerText=voltVal+'V';document.getElementById('speed').innerText=d.speed||'---';document.getElementById('ip').innerText=d.ip||'—';document.getElementById('timeNow').innerText=(d.time||'--').replace('T',' ');document.getElementById('uptime').innerText=formatUptime(d.uptime);const badge=document.getElementById('canBadge');if(badge){badge.innerText=d.canOk?'CAN онлайн':'CAN нет данных';badge.className='badge '+(d.canOk?'ok':'err');}if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}if(!prefLock){const energy=document.getElementById('energy');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(energy)energy.checked=!!d.energy;if(is24)is24.checked=!!d.is24;if(isc)isc.checked=!!d.isC;}if(timeInput&&document.activeElement!==timeInput&&d.time){let v=d.time.length>=16?d.time.substring(0,16):d.time;timeInput.value=v;}}catch(e){console.error(e);}}"
+         "function init(){blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}timeInput=document.getElementById('timeInput');const energy=document.getElementById('energy');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(energy){energy.addEventListener('change',()=>updatePref('energy',energy.checked));}if(is24){is24.addEventListener('change',()=>updatePref('is24',is24.checked));}if(isc){isc.addEventListener('change',()=>updatePref('isc',isc.checked));}refresh();setInterval(refresh,1500);}"
          "async function setBrightness(v){try{let r=await fetch('/brightness?value='+v);if(!r.ok)throw new Error();}catch(e){alert('Не удалось обновить подсветку');}}"
          "async function updatePref(name,val){prefLock=true;try{let r=await fetch('/prefs?'+name+'='+(val?'1':'0'));if(!r.ok)throw new Error();}catch(e){alert('Не удалось сохранить настройки');}finally{prefLock=false;}}"
          "function pad2(n){return n.toString().padStart(2,'0');}"
@@ -646,6 +759,7 @@ static String page() {
 
   s += F("<div class='card'>"
          "<h3>Настройки отображения</h3>"
+         "<div class='toggle'><input type='checkbox' id='energy'/><label for='energy'>Энергосбережение по зажиганию</label></div>"
          "<div class='toggle'><input type='checkbox' id='is24'/><label for='is24'>24-часовой формат времени</label></div>"
          "<div class='toggle'><input type='checkbox' id='isc'/><label for='isc'>Температура в градусах Цельсия</label></div>"
          "<p class='small'>Параметры мгновенно применяются к эмуляции BSI и сохраняются в памяти.</p>"
@@ -704,7 +818,7 @@ static void handleData() {
   json += bitrateName(currentBitrate);
   json += "\"";
   json += ",\"brightness\":";
-  json += String((int)brightness);
+  json += String((int)brightnessSetting);
   json += ",\"is24\":";
   json += bsiIs24h ? "true" : "false";
   json += ",\"isC\":";
@@ -713,11 +827,15 @@ static void handleData() {
   json += iso8601Now();
   json += "\"";
   json += ",\"ip\":\"";
-  json += WiFi.softAPIP().toString();
+  json += wifiActive ? WiFi.softAPIP().toString() : String("--");
   json += "\"";
   json += ",\"canOk\":";
   bool canOk = (millis() - lastCanRx) < 2000u;
   json += canOk ? "true" : "false";
+  json += ",\"energy\":";
+  json += energySavingEnabled ? "true" : "false";
+  json += ",\"ignition\":";
+  json += ignitionOn ? "true" : "false";
   json += ",\"uptime\":";
   json += String((uint32_t)(millis() / 1000u));
   json += "}";
@@ -750,11 +868,11 @@ static void handleBrightness() {
   if (v > 255) v = 255;
 
   uint8_t newBrightness = (uint8_t)v;
-  uint8_t previousBrightness = brightness;
-  applyBrightness(newBrightness);
-  if (newBrightness != previousBrightness) {
-    prefs.putUChar(kPrefBrightness, brightness);
+  if (newBrightness != brightnessSetting) {
+    brightnessSetting = newBrightness;
+    prefs.putUChar(kPrefBrightness, brightnessSetting);
   }
+  refreshBacklight();
   server.send(200, "text/plain", "OK");
 }
 
@@ -782,6 +900,7 @@ static void handlePrefs() {
   bool changed = false;
   bool need260 = false;
   bool need276 = false;
+  bool energyChanged = false;
 
   if (server.hasArg("is24")) {
     bool newVal = server.arg("is24") != "0";
@@ -801,6 +920,16 @@ static void handlePrefs() {
     }
   }
 
+  if (server.hasArg("energy")) {
+    bool newVal = server.arg("energy") != "0";
+    if (newVal != energySavingEnabled) {
+      energySavingEnabled = newVal;
+      energyChanged = true;
+      prefs.putBool(kPrefEnergySaving, energySavingEnabled);
+      updatePowerState();
+    }
+  }
+
   if (changed) {
     bsiSaveState();
     if (need260) {
@@ -809,6 +938,11 @@ static void handlePrefs() {
     if (need276) {
       bsiSend276();
     }
+  }
+
+  if (!energyChanged && (server.hasArg("energy"))) {
+    // Persist state even if unchanged to ensure consistency.
+    prefs.putBool(kPrefEnergySaving, energySavingEnabled);
   }
 
   server.send(200, "text/plain", "OK");
@@ -856,8 +990,12 @@ void setup() {
   analogWriteFrequency(TFT_BL, 5000);
 
   prefs.begin(kPrefsNamespace, false);
-  uint8_t savedBrightness = prefs.getUChar(kPrefBrightness, brightness);
-  applyBrightness(savedBrightness);
+  brightnessSetting = prefs.getUChar(kPrefBrightness, brightnessSetting);
+  energySavingEnabled = prefs.getBool(kPrefEnergySaving, energySavingEnabled);
+  ignitionOn = !energySavingEnabled;
+  Serial.printf("[POWER] Energy saving %s\n", energySavingEnabled ? "ENABLED" : "DISABLED");
+  refreshBacklight();
+  updatePowerState();
   bsiLoadState();
 
   if (CAN_STANDBY_PIN >= 0) {
@@ -872,10 +1010,7 @@ void setup() {
   gfx->setCursor(20, 60);
   gfx->println("Starting...");
 
-  // Wi-Fi
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  Serial.printf("[WiFi] AP: %s, IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  // Wi-Fi state already set by updatePowerState()
 
   // CAN
   if (!twaiStart()) Serial.println("[CAN] init failed");
@@ -899,6 +1034,15 @@ void setup() {
 void loop() {
   server.handleClient();
   readCanMessages();
+  unsigned long now = millis();
+  if (energySavingEnabled) {
+    if (now - lastIgnitionFrame > IGNITION_TIMEOUT_MS) {
+      setIgnition(false);
+    }
+  }
+  if (lampsOn && (now - lastLampsFrame > LAMPS_TIMEOUT_MS)) {
+    setLamps(false);
+  }
   bsiTick();
   updateDisplay();
 }
