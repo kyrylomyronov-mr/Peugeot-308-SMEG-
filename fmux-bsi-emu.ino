@@ -19,8 +19,8 @@
 #include <time.h>
 
 // --------- CAN pins (ESP32-C6) ----------
-static constexpr gpio_num_t CAN_TX = GPIO_NUM_20;
-static constexpr gpio_num_t CAN_RX = GPIO_NUM_23;
+static constexpr gpio_num_t CAN_TX = GPIO_NUM_23;
+static constexpr gpio_num_t CAN_RX = GPIO_NUM_20;
 
 // SN65HVD230 transceiver standby (RS) pin. Set to -1 if RS is tied to GND.
 static constexpr int CAN_STANDBY_PIN = -1;
