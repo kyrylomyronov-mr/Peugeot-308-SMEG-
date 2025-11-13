@@ -105,6 +105,19 @@ static constexpr uint32_t CAN_ID_276 = 0x276; // BSI broadcast date/time
 static constexpr unsigned long BSI_PERIOD_260_MS = 500;
 static constexpr unsigned long BSI_PERIOD_276_MS = 1000;
 
+// Peugeot 307 (full CAN) BSI broadcast 0x260 baseline.
+// Значения соответствуют штатной конфигурации Peugeot 307 Full CAN.
+static constexpr uint8_t kBsi260DefaultPeugeot307[8] = {
+  0xB8, // Byte0: Lang=RU (0b01110), меню активно, остальные биты как в стоке
+  0x44, // Byte1: метрическая система + конфигурационные флаги
+  0x22, // Byte2: тип кузова/адаптации
+  0x90, // Byte3: конфигурация приборов и кнопок на руле
+  0x21, // Byte4: тип мультимедиа/телематики
+  0x08, // Byte5: наличие ESP/ABS и датчиков парковки
+  0x00, // Byte6: зарезервировано
+  0x00  // Byte7: зарезервировано
+};
+
 static uint8_t bsiState260[8] = {0};
 static bool bsiHave260 = false;
 static uint8_t bsiLang5 = 0b01110; // default Russian
@@ -120,9 +133,11 @@ static void bsiLoadState();
 static void bsiPersistTime(time_t epoch);
 static void bsiHandle15B(const uint8_t *data, uint8_t len);
 static void bsiHandle39B(const uint8_t *data, uint8_t len);
+static void bsiBuild276(uint8_t out[7]);
 static void bsiSend260();
 static void bsiSend276();
 static void bsiTick();
+static String frameHex(const uint8_t *data, size_t len);
 
 static String iso8601Now();
 static bool parseIso8601(const String &iso, time_t &outEpoch);
@@ -279,8 +294,7 @@ static inline void bsiSetBit(uint8_t &byte, uint8_t mask, bool value) {
 
 static void bsiEnsureBaseline() {
   if (bsiHave260) return;
-  memset(bsiState260, 0, sizeof(bsiState260));
-  bsiState260[0] |= 0x80; // menu active bit
+  memcpy(bsiState260, kBsi260DefaultPeugeot307, sizeof(bsiState260));
   bsiHave260 = true;
 }
 
@@ -304,6 +318,13 @@ static void bsiLoadState() {
   size_t sz = prefs.getBytesLength(kPrefRaw260);
   if (sz >= sizeof(bsiState260)) {
     prefs.getBytes(kPrefRaw260, bsiState260, sizeof(bsiState260));
+    bool allZero = true;
+    for (size_t i = 0; i < sizeof(bsiState260); ++i) {
+      if (bsiState260[i] != 0) { allZero = false; break; }
+    }
+    if (allZero) {
+      memcpy(bsiState260, kBsi260DefaultPeugeot307, sizeof(bsiState260));
+    }
     bsiHave260 = true;
   } else {
     bsiHave260 = false;
@@ -445,6 +466,21 @@ static void bsiTick() {
   if (now - lastBsi276 >= BSI_PERIOD_276_MS) {
     bsiSend276();
   }
+}
+
+static String frameHex(const uint8_t *data, size_t len) {
+  String out;
+  if (!data || len == 0) {
+    return out;
+  }
+  out.reserve(len * 3 - 1);
+  for (size_t i = 0; i < len; ++i) {
+    if (i) out += ' ';
+    char buf[3];
+    snprintf(buf, sizeof(buf), "%02X", data[i]);
+    out += buf;
+  }
+  return out;
 }
 
 static String iso8601FromTm(const struct tm &tmv) {
@@ -724,6 +760,7 @@ static String page() {
          ".metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:18px;}"
          ".metric .label{font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;}"
          ".metric .value{font-size:26px;font-weight:600;color:#f1f5f9;}"
+         ".metric .value.hex{font-family:'JetBrains Mono','Fira Code','SFMono-Regular',monospace;font-size:18px;letter-spacing:.08em;}"
          ".badge{display:inline-flex;align-items:center;padding:6px 14px;border-radius:999px;font-size:13px;font-weight:600;}"
          ".badge.ok{background:rgba(34,197,94,0.18);color:#4ade80;}"
          ".badge.err{background:rgba(248,113,113,0.18);color:#f87171;}"
@@ -747,7 +784,7 @@ static String page() {
          "function formatUptime(secs){secs=Number(secs||0);if(secs<0)secs=0;const h=Math.floor(secs/3600);const m=Math.floor((secs%3600)/60);const s=Math.floor(secs%60);let parts=[];if(h)parts.push(h+' ч');if(m||h)parts.push(m+' м');parts.push(s+' с');return parts.join(' ');}"
          "async function refresh(){try{let r=await fetch('/data');if(!r.ok)return;let d=await r.json();const tempVal=(typeof d.temp==='number')?d.temp.toFixed(1):d.temp;document.getElementById('temp').innerText=tempVal+(d.isC?'°C':'°F');"
          "const iatVal=(typeof d.iat==='number')?d.iat.toFixed(1):d.iat;document.getElementById('iat').innerText=iatVal+(d.isC?'°C':'°F');"
-        "const voltVal=(typeof d.volt==='number')?d.volt.toFixed(1):d.volt;document.getElementById('volt').innerText=voltVal+'V';document.getElementById('speed').innerText=d.speed||'---';document.getElementById('ip').innerText=d.ip||'—';document.getElementById('timeNow').innerText=(d.time||'--').replace('T',' ');document.getElementById('uptime').innerText=formatUptime(d.uptime);const badge=document.getElementById('canBadge');if(badge){badge.innerText=d.canOk?'CAN онлайн':'CAN нет данных';badge.className='badge '+(d.canOk?'ok':'err');}if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}if(!prefLock){const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24)is24.checked=!!d.is24;if(isc)isc.checked=!!d.isC;}if(timeInput&&document.activeElement!==timeInput&&d.time){let v=d.time.length>=16?d.time.substring(0,16):d.time;timeInput.value=v;}}catch(e){console.error(e);}}"
+        "const voltVal=(typeof d.volt==='number')?d.volt.toFixed(1):d.volt;document.getElementById('volt').innerText=voltVal+'V';document.getElementById('speed').innerText=d.speed||'---';document.getElementById('ip').innerText=d.ip||'—';document.getElementById('timeNow').innerText=(d.time||'--').replace('T',' ');document.getElementById('uptime').innerText=formatUptime(d.uptime);const bsi260El=document.getElementById('bsi260');if(bsi260El)bsi260El.innerText=(d.bsi260&&d.bsi260.length)?d.bsi260:'--';const bsi276El=document.getElementById('bsi276');if(bsi276El)bsi276El.innerText=(d.bsi276&&d.bsi276.length)?d.bsi276:'--';const badge=document.getElementById('canBadge');if(badge){badge.innerText=d.canOk?'CAN онлайн':'CAN нет данных';badge.className='badge '+(d.canOk?'ok':'err');}if(blSlider){if(!blLock){blSlider.value=d.brightness;}updateBrightnessLabel(Number(blSlider.value));}if(!prefLock){const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24)is24.checked=!!d.is24;if(isc)isc.checked=!!d.isC;}if(timeInput&&document.activeElement!==timeInput&&d.time){let v=d.time.length>=16?d.time.substring(0,16):d.time;timeInput.value=v;}}catch(e){console.error(e);}}"
          "function init(){blSlider=document.getElementById('bl');if(blSlider){blSlider.addEventListener('input',()=>{blLock=true;updateBrightnessLabel(Number(blSlider.value));});blSlider.addEventListener('change',async()=>{let v=blSlider.value;await setBrightness(v);blLock=false;});}timeInput=document.getElementById('timeInput');const is24=document.getElementById('is24');const isc=document.getElementById('isc');if(is24){is24.addEventListener('change',()=>updatePref('is24',is24.checked));}if(isc){isc.addEventListener('change',()=>updatePref('isc',isc.checked));}refresh();setInterval(refresh,1500);}"
          "async function setBrightness(v){try{let r=await fetch('/brightness?value='+v);if(!r.ok)throw new Error();}catch(e){alert('Не удалось обновить подсветку');}}"
          "async function updatePref(name,val){prefLock=true;try{let r=await fetch('/prefs?'+name+'='+(val?'1':'0'));if(!r.ok)throw new Error();}catch(e){alert('Не удалось сохранить настройки');}finally{prefLock=false;}}"
@@ -769,6 +806,15 @@ static String page() {
          "<div class='metric'><div class='label'>Аптайм</div><div class='value' id='uptime'>--</div></div>"
          "</div>"
          "<span class='badge err' id='canBadge'>CAN нет данных</span>"
+         "</div>");
+
+  s += F("<div class='card'>"
+         "<h3>BSI кадры</h3>"
+         "<p class='small'>Контрольные значения эмулятора для Peugeot 307 Full CAN.</p>"
+         "<div class='metrics'>"
+         "<div class='metric'><div class='label'>BSI 0x260</div><div class='value hex' id='bsi260'>--</div></div>"
+         "<div class='metric'><div class='label'>BSI 0x276</div><div class='value hex' id='bsi276'>--</div></div>"
+         "</div>"
          "</div>");
 
   s += F("<div class='card'>"
@@ -841,7 +887,7 @@ static void appendTempJson(String &json, const char *key, float value) {
 
 static void handleData() {
   String json(F("{"));
-  json.reserve(256);
+  json.reserve(360);
 
   appendTempJson(json, "temp", engineTemp);
   json += ',';
@@ -888,6 +934,21 @@ static void handleData() {
 
   json += F(",\"uptime\":");
   json += String(static_cast<uint32_t>(millis() / 1000u));
+
+  bsiEnsureBaseline();
+  bsiApplyLangUnits();
+  String bsi260Hex = frameHex(bsiState260, sizeof(bsiState260));
+  uint8_t bsi276Payload[7];
+  bsiBuild276(bsi276Payload);
+  String bsi276Hex = frameHex(bsi276Payload, sizeof(bsi276Payload));
+
+  json += F(",\"bsi260\":\"");
+  json += bsi260Hex;
+  json += '"';
+
+  json += F(",\"bsi276\":\"");
+  json += bsi276Hex;
+  json += '"';
 
   json += '}';
   server.send(200, "application/json", json);
