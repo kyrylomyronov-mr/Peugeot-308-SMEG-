@@ -69,7 +69,7 @@ static void handleRoot() {
                ".sync{background:#252;width:95%}"
                "</style></head><body>"
                "<h2>SMEG Minimal Remote</h2>"
-               "<button class='sync' onclick='fetch(\"/sync\")'>🕒 Sync Time from Browser</button><br/>"
+               "<button class='sync' onclick='let d=new Date();fetch(`/sync?y=${d.getFullYear()}&mo=${d.getMonth()+1}&d=${d.getDate()}&h=${d.getHours()}&m=${d.getMinutes()}`)'>🕒 Sync Time from Browser</button><br/>"
                "<div style='display:flex;flex-wrap:wrap;justify-content:center;margin-top:20px;'>"
                "<button onclick='fetch(\"/btn?n=17\")'>⚙️ Settings</button>"
                "<button onclick='fetch(\"/btn?n=18\")'>🗺️ Maps</button>"
@@ -96,7 +96,20 @@ void setup() {
     server.send(200, "text/plain", "OK");
   });
   server.on("/sync", []() {
-    uint8_t d[8] = {0x80, 0x19, 0x01, 0x0C, 0x00, 0x3F, 0xFE, 0x00}; // Default 12:00, 24h, 2025
+    uint8_t y = server.hasArg("y") ? (server.arg("y").toInt() >= 2000 ? server.arg("y").toInt() - 2000 : 25) : 25;
+    uint8_t mo = server.hasArg("mo") ? server.arg("mo").toInt() : 1;
+    uint8_t day = server.hasArg("d") ? server.arg("d").toInt() : 12;
+    uint8_t h = server.hasArg("h") ? server.arg("h").toInt() : 12;
+    uint8_t m = server.hasArg("m") ? server.arg("m").toInt() : 0;
+
+    uint8_t d[8] = {0};
+    d[0] = 0x80 | (y & 0x7F);  // 24h & year
+    d[1] = mo & 0x0F;
+    d[2] = day & 0x1F;
+    d[3] = h & 0x1F;
+    d[4] = m & 0x3F;
+    d[5] = 0x3F;
+    d[6] = 0xFE;
     canSend(0x276, d, 8);
     server.send(200, "text/plain", "OK sync");
   });
