@@ -9,6 +9,7 @@
  */
 
 #include "driver/twai.h"
+#include "page_html.h"
 #include <Adafruit_NeoPixel.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
@@ -16,7 +17,6 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include "page_html.h"
 #include <driver/gpio.h>
 #include <esp_err.h>
 #include <esp_sleep.h>
@@ -25,13 +25,13 @@
 #include <sys/time.h>
 #include <time.h>
 
-// --------- CAN0 pins (Car Side) ----------
-static constexpr gpio_num_t CAN0_TX = GPIO_NUM_22;
-static constexpr gpio_num_t CAN0_RX = GPIO_NUM_21;
-
 // --------- CAN1 pins (Radio Side) ----------
-static constexpr gpio_num_t CAN1_TX = GPIO_NUM_19;
-static constexpr gpio_num_t CAN1_RX = GPIO_NUM_20;
+static constexpr gpio_num_t CAN1_TX = GPIO_NUM_22;
+static constexpr gpio_num_t CAN1_RX = GPIO_NUM_21;
+
+// --------- CAN0 pins (Car Side) ----------
+static constexpr gpio_num_t CAN0_TX = GPIO_NUM_19;
+static constexpr gpio_num_t CAN0_RX = GPIO_NUM_20;
 
 static constexpr int CAN_STANDBY_PIN = -1;
 
@@ -76,7 +76,8 @@ static bool wifiActive = false;
 static String wifiIp;
 static bool ignitionOn = false; // false until confirmed by CAN
 static unsigned long lastIgnitionFrame = 0;
-static unsigned long lastCar260 = 0; // Track last car 0x260 to inhibit synthetic ticks
+static unsigned long lastCar260 =
+    0; // Track last car 0x260 to inhibit synthetic ticks
 static Preferences prefs;
 
 static constexpr const char *kPrefsNamespace = "psacan";
@@ -167,9 +168,8 @@ static void updateLed() {
   blinkState = !blinkState;
 
   // canOk requires >= 3 received frames to filter out pin-noise false-positives
-  bool canOk =
-      ((can0ValidFrames >= 3) || (can1ValidFrames >= 3)) && 
-      ((now - lastCanRx) < CAN_STALE_TIMEOUT_MS);
+  bool canOk = ((can0ValidFrames >= 3) || (can1ValidFrames >= 3)) &&
+               ((now - lastCanRx) < CAN_STALE_TIMEOUT_MS);
 
   uint32_t colour;
   if (canOk && rtcSynced) {
@@ -323,7 +323,6 @@ static void enterLightSleep() {
   lastCanRx = millis();
 }
 
-
 // --------- CAN Init ----------
 static bool twaiStart() {
   twai_timing_config_t t = TWAI_TIMING_CONFIG_125KBITS();
@@ -392,7 +391,6 @@ static bool canSendCar(uint32_t id, const uint8_t *d, uint8_t dlc) {
 static bool canSend122(const uint8_t *d, uint8_t dlc) {
   return canSendRadio(0x122, d, dlc); // Buttons go to Radio
 }
-
 
 static inline void sendIdle122() {
   uint8_t z[8] = {0};
@@ -549,7 +547,8 @@ static void bsiHandle39B(const uint8_t *data, uint8_t len) {
   ct.day = data[2] & 0x1Fu;
   ct.hour = data[3] & 0x1Fu;
   ct.minute = data[4] & 0x3Fu;
-  if (ct.month == 0 || ct.day == 0) return;
+  if (ct.month == 0 || ct.day == 0)
+    return;
 
   bsiIs24h = ct.is24;
   bsiSaveState();
@@ -722,10 +721,14 @@ static void processBus(twai_handle_t src, twai_handle_t dst, bool isCarSide) {
           msg.data_length_code >= 3) {
         uint8_t d = msg.data[2];
         uint8_t newD = d & 0x0F;
-        if (d & 0x10) newD |= 0x20;
-        if (d & 0x20) newD |= 0x10;
-        if (d & 0x40) newD |= 0x80;
-        if (d & 0x80) newD |= 0x40;
+        if (d & 0x10)
+          newD |= 0x20;
+        if (d & 0x20)
+          newD |= 0x10;
+        if (d & 0x40)
+          newD |= 0x80;
+        if (d & 0x80)
+          newD |= 0x40;
         msg.data[2] = newD;
       }
 
@@ -733,11 +736,13 @@ static void processBus(twai_handle_t src, twai_handle_t dst, bool isCarSide) {
       bool ignOn = false;
       bool hasIgnFrame = false;
       if (msg.identifier == 0x128 && msg.data_length_code >= 1) {
-        if ((msg.data[0] & 0xC0u) != 0) ignOn = true;
+        if ((msg.data[0] & 0xC0u) != 0)
+          ignOn = true;
         hasIgnFrame = true;
       }
       if (msg.identifier == 0x0A8 && msg.data_length_code >= 3) {
-        if ((msg.data[2] & 0xC0u) != 0) ignOn = true;
+        if ((msg.data[2] & 0xC0u) != 0)
+          ignOn = true;
         hasIgnFrame = true;
       }
       if (hasIgnFrame) {
@@ -875,7 +880,6 @@ static void handleBtn() {
   server.send(200, "text/plain", "OK");
 }
 
-
 static void handlePrefs() {
   bool changed = false;
   bool need260 = false;
@@ -977,7 +981,7 @@ static void handleEmf() {
 static void handleConf() {
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   gwConfig.swapDoors = !gwConfig.swapDoors; // Toggle
-  bsiSaveState(); // Persist setting
+  bsiSaveState();                           // Persist setting
   server.sendHeader("Location", "/");
   server.send(303);
 }
