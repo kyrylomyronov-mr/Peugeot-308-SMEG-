@@ -48,10 +48,6 @@ static constexpr uint32_t CAN_ID_HMI_CMD =
     0x1A9; // HMI Buttons from screen/steering
 static constexpr uint32_t CAN_ID_CONF_SYNC =
     0x15B; // SMEG Configuration Sync request
-static constexpr uint32_t CAN_ID_CAR_ECO_MODE =
-    0x036; // CAN2004 Economy Mode status
-static constexpr uint32_t CAN_ID_POWER_MGMT =
-    0x236; // CAN2010 Power Management
 
 // --------- State & Emulation Variables ----------
 static unsigned long lastCan0Rx = 0; // Timestamp of last CAR message
@@ -64,7 +60,6 @@ static bool bsiDRL = true;        // Daytime Running Lights status (0x260 D2[1])
 static bool bsiParkAssist = true; // Parking Assistance status (0x260 D4[7])
 static bool bsiGrilleLight = false; // Grille Illumination status (0x260 D6[2])
 static bool carReverse = false;     // Real vehicle reverse status
-static bool carEconomyMode = false; // Real vehicle economy status (0x036)
 static bool lastBtn1A9 = false;     // State of button on 1A9 command
 static Preferences prefs;
 
@@ -173,18 +168,20 @@ static void processBus(twai_handle_t src, twai_handle_t dst, bool isCarSide) {
       if (msg.identifier == CAN_ID_BSI_INFO || msg.identifier == CAN_ID_OPTIONS)
         continue;
 
-      // Monitor BSI_SLOW for Reverse status (CAN2004/2010 common frame)
+      // Monitor BSI_SLOW for Reverse status and Economy mode flags
       if (msg.identifier == CAN_ID_BSI_SLOW && msg.data_length_code >= 8) {
         memcpy(last0F6, msg.data,
                8); // Save real frame baseline (brightness, etc.)
         carReverse = (msg.data[7] & 0x80) != 0;
 
+        // Economy Mode Control (D5[0]): 1=Eco, 0=Normal
+        if (ecoBypass)
+          msg.data[5] &= ~0x01; // Force Normal to keep radio ON
+        if (ecoForce)
+          msg.data[5] |= 0x01; // Force Economy to turn radio OFF
+
         if (forceParking)
           continue; // Block real reverse to allow emulation
-      }
-      // Monitor CAN2004 Economy Mode (0x036 D2 bit 7)
-      if (msg.identifier == CAN_ID_CAR_ECO_MODE && msg.data_length_code >= 3) {
-        carEconomyMode = (msg.data[2] & 0x80) != 0;
       }
       if (msg.identifier == CAN_ID_RADIO_BTNS && msg.data_length_code >= 8) {
         memcpy(last122, msg.data, 8);
@@ -300,36 +297,6 @@ static void runParkingEmulation() {
   dp[4] = (parkDist[2] << 5) | (parkDist[3] << 2);
   dp[5] = (parkDist[4] << 5) | (parkDist[5] << 2) | 0x02; // AAS Active status
   canSend(can1_handle, CAN_ID_PARK_SENSORS, dp, 8);
-}
-
-// Periodically sends CAN2010 Power Management frame (based on Ludwig's method)
-static void runPowerManagement() {
-  static unsigned long lastPwr = 0;
-  unsigned long now = millis();
-  if (now - lastPwr < 500)
-    return;
-  lastPwr = now;
-  if (!can1_handle)
-    return;
-
-  // Default values for 0x236 (Normal status)
-  uint8_t d[8] = {0x54, 0x03, 0xDE, 0x00, 0x00, 0x0F, 0xFE, 0x00};
-
-  bool targetEco = carEconomyMode;
-  if (ecoBypass)
-    targetEco = false; // Bypass car's economy mode
-  if (ecoForce)
-    targetEco = true; // Remotely force radio OFF
-
-  if (targetEco) {
-    d[0] = 0x14; // Economy state (D0)
-    d[5] = 0x0E; // Economy status (D5)
-  } else {
-    d[0] = 0x54; // Engine / Normal state (D0)
-    d[5] = 0x0F; // Normal operation (D5)
-  }
-
-  canSend(can1_handle, CAN_ID_POWER_MGMT, d, 8);
 }
 
 static void pressIndex(uint8_t idx, uint16_t duration = 100) {
@@ -557,7 +524,6 @@ void loop() {
   }
   runClockEmulation();
   runBsiHeartbeat();
-  runPowerManagement();
   runParkingEmulation();
   if (btnReleaseAt && now > btnReleaseAt) {
     memset(mod122, 0, 8);
