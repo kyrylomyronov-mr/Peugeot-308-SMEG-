@@ -765,8 +765,9 @@ static void processBus(twai_handle_t src, twai_handle_t dst, bool isCarSide) {
         bool newDrl = (msg.data[2] & 0x10) != 0;
         if (newDrl != gwConfig.drl) {
           gwConfig.drl = newDrl;
-          bsiSaveState();
         }
+        // Вызываем полный обработчик (для языков и парктроников)
+        bsiHandle15B(msg.data, msg.data_length_code);
       }
 
       // SMEG Time Sync 0x39B
